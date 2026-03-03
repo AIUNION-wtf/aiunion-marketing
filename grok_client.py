@@ -9,13 +9,18 @@ Grok (xAI) API wrapper for AIUNION marketing agent.
 import os
 import json
 import logging
-from typing import Optional
-import urllib.request
-import urllib.error
+
+try:
+    from openai import OpenAI
+    from openai import APIConnectionError, APIStatusError, RateLimitError
+except Exception:  # pragma: no cover - handled at runtime with machine-readable error
+    OpenAI = None
+    APIConnectionError = Exception
+    APIStatusError = Exception
+    RateLimitError = Exception
 
 logger = logging.getLogger(__name__)
 
-XAI_API_URL = "https://api.x.ai/v1/chat/completions"
 MODEL = "grok-3"
 MAX_TOKENS = 512
 MAX_PROMPT_CHARS = 4000  # input size limit (rule #5)
@@ -46,6 +51,43 @@ def _get_api_key() -> str:
     return key
 
 
+def _safe_truncate(value: str, limit: int = 200) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit]
+
+
+def _extract_retry_after(exc: Exception, fallback: int = 60) -> int:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    retry_after_raw = (
+        headers.get("Retry-After")
+        or headers.get("retry-after")
+    )
+    if not retry_after_raw:
+        return fallback
+    try:
+        value = int(str(retry_after_raw).strip())
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return fallback
+
+
+def _extract_api_error_details(exc: Exception) -> str:
+    body = getattr(exc, "body", None)
+    if body is not None:
+        try:
+            if isinstance(body, (dict, list)):
+                return _safe_truncate(json.dumps(body, separators=(",", ":")))
+            return _safe_truncate(str(body))
+        except Exception:
+            pass
+    return _safe_truncate(str(exc))
+
+
 def generate_post(prompt: str, label_automated: bool = True) -> str:
     """
     Generate a tweet-length post using Grok.
@@ -61,60 +103,88 @@ def generate_post(prompt: str, label_automated: bool = True) -> str:
         }))
 
     api_key = _get_api_key()
+    if OpenAI is None:
+        raise RuntimeError(json.dumps({
+            "error_code": "DEPENDENCY_MISSING",
+            "error": "openai package is not installed",
+            "details": "Install with: pip install openai"
+        }))
 
     user_content = prompt
     if label_automated:
         user_content += "\n\nEnd the post with [AUTO]"
 
-    payload = json.dumps({
-        "model": MODEL,
-        "max_tokens": MAX_TOKENS,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content}
-        ]
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-    XAI_API_URL,
-    data=payload,
-    headers={
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-        "User-Agent": "AIUNION-MarketingAgent/1.0"
-    },
-        method="POST"
-    )
-
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            text = data["choices"][0]["message"]["content"].strip()
-            # Enforce 280 char limit
-            if len(text) > 280:
-                text = text[:277] + "..."
-            logger.info("Post generated successfully (length=%d)", len(text))
-            return text
-
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        # Rule #8: don't log the key, only log status code
-        if e.code == 429:
+        # Use OpenAI-compatible SDK for xAI endpoint.
+        # This client stack is generally more reliable in CI than raw urllib.
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.x.ai/v1",
+            timeout=30.0,
+            max_retries=1,
+            default_headers={
+                "User-Agent": "AIUNION-MarketingAgent/1.1",
+                "Accept": "application/json",
+            },
+        )
+        response = client.chat.completions.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+        )
+        text = (response.choices[0].message.content or "").strip()
+        if not text:
             raise RuntimeError(json.dumps({
-                "error_code": "RATE_LIMITED",
-                "error": "xAI API rate limit hit",
-                "details": "Retry after 60 seconds",
-                "retry_after": 60
+                "error_code": "EMPTY_RESPONSE",
+                "error": "xAI API returned empty content",
+                "details": "No message content in first choice"
             }))
+
+        # Enforce 280 char limit
+        if len(text) > 280:
+            text = text[:277] + "..."
+        logger.info("Post generated successfully (length=%d)", len(text))
+        return text
+
+    except RateLimitError as e:
+        retry_after = _extract_retry_after(e, fallback=60)
         raise RuntimeError(json.dumps({
-            "error_code": "XAI_API_ERROR",
-            "error": f"xAI API returned HTTP {e.code}",
-            "details": body[:200]  # truncate, never log full response
+            "error_code": "RATE_LIMITED",
+            "error": "xAI API rate limit hit",
+            "details": f"Retry after {retry_after} seconds",
+            "retry_after": retry_after
         }))
 
-    except urllib.error.URLError as e:
+    except APIConnectionError as e:
         raise RuntimeError(json.dumps({
             "error_code": "NETWORK_ERROR",
             "error": "Failed to reach xAI API",
-            "details": str(e.reason)
+            "details": _safe_truncate(str(e))
+        }))
+
+    except APIStatusError as e:
+        status = getattr(e, "status_code", "unknown")
+        if status == 429:
+            retry_after = _extract_retry_after(e, fallback=60)
+            raise RuntimeError(json.dumps({
+                "error_code": "RATE_LIMITED",
+                "error": "xAI API rate limit hit",
+                "details": f"Retry after {retry_after} seconds",
+                "retry_after": retry_after
+            }))
+
+        raise RuntimeError(json.dumps({
+            "error_code": "XAI_API_ERROR",
+            "error": f"xAI API returned HTTP {status}",
+            "details": _extract_api_error_details(e)
+        }))
+
+    except Exception as e:
+        raise RuntimeError(json.dumps({
+            "error_code": "XAI_API_ERROR",
+            "error": "xAI API request failed",
+            "details": _safe_truncate(str(e))
         }))
