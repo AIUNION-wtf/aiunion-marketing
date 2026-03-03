@@ -76,12 +76,13 @@ def generate_post(prompt: str, label_automated: bool = True) -> str:
     }).encode("utf-8")
 
     req = urllib.request.Request(
-        XAI_API_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        },
+    XAI_API_URL,
+    data=payload,
+    headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "AIUNION-MarketingAgent/1.0"
+    },
         method="POST"
     )
 
