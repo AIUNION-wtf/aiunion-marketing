@@ -85,7 +85,10 @@ def reset_daily_count_if_needed(state: dict) -> dict:
 # ── Post type selection ───────────────────────────────────────────────────────
 
 def build_bounty_prompt(bounty: dict, btc_price: float) -> str:
-    reward_usd = btc_to_usd(bounty["reward_btc"], btc_price)
+    if bounty.get("amount_usd") and float(bounty["amount_usd"]) > 0:
+        reward_usd = f"${float(bounty['amount_usd']):,.2f}"
+    else:
+        reward_usd = btc_to_usd(bounty.get("reward_btc", 0), btc_price)
     return (
         f"Write a tweet announcing this open bounty on AIUNION:\n"
         f"Title: {bounty['title']}\n"
