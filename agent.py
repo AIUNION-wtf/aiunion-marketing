@@ -34,6 +34,30 @@ logger = logging.getLogger("aiunion.agent")
 STATE_FILE = Path("state.json")  # tracked in .gitignore
 MAX_DAILY_POSTS = 5
 
+# ── BTC price fetch ───────────────────────────────────────────────────────────
+
+def fetch_btc_price() -> float:
+    """Fetch live BTC/USD price from mempool.space. Returns 0.0 on failure."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://mempool.space/api/v1/prices",
+            headers={"User-Agent": "AIUNION-MarketingAgent/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read())
+            return float(data.get("USD", 0))
+    except Exception:
+        return 0.0
+
+
+def btc_to_usd(btc: float, price: float) -> str:
+    """Format BTC amount as USD string."""
+    if price > 0 and btc > 0:
+        usd = btc * price
+        return f"${usd:,.2f}"
+    return "$0.00"
+
 
 # ── State management ──────────────────────────────────────────────────────────
 
@@ -60,22 +84,23 @@ def reset_daily_count_if_needed(state: dict) -> dict:
 
 # ── Post type selection ───────────────────────────────────────────────────────
 
-def build_bounty_prompt(bounty: dict) -> str:
-    reward_sats = int(bounty["reward_btc"] * 1e8)
+def build_bounty_prompt(bounty: dict, btc_price: float) -> str:
+    reward_usd = btc_to_usd(bounty["reward_btc"], btc_price)
     return (
         f"Write a tweet announcing this open bounty on AIUNION:\n"
         f"Title: {bounty['title']}\n"
-        f"Reward: {reward_sats:,} sats ({bounty['reward_btc']} BTC)\n"
+        f"Reward: {reward_usd} USD\n"
         f"Description: {bounty['description']}\n"
         f"Link: https://aiunion.wtf\n"
         f"Make it compelling for developers and crypto builders."
     )
 
 
-def build_treasury_prompt(status: dict) -> str:
+def build_treasury_prompt(status: dict, btc_price: float) -> str:
+    balance_usd = btc_to_usd(status['balance_btc'], btc_price)
     return (
         f"Write a tweet giving a treasury update for AIUNION:\n"
-        f"Current balance: {status['balance_btc']} BTC\n"
+        f"Current balance: {balance_usd} USD\n"
         f"Open bounties: {status['open_bounties']}\n"
         f"Total proposals voted on: {status['total_proposals']} "
         f"({status['approved']} approved)\n"
@@ -84,11 +109,12 @@ def build_treasury_prompt(status: dict) -> str:
     )
 
 
-def build_proposal_prompt(proposal: dict) -> str:
+def build_proposal_prompt(proposal: dict, btc_price: float) -> str:
+    amount_usd = btc_to_usd(proposal.get('amount_btc', 0), btc_price)
     return (
         f"Write a tweet announcing a recently approved AIUNION proposal:\n"
         f"Title: {proposal['title']}\n"
-        f"Amount: {proposal['amount_btc']} BTC\n"
+        f"Amount: {amount_usd} USD\n"
         f"Vote summary: {proposal['vote_summary']}\n"
         f"Link: https://aiunion.wtf\n"
         f"Highlight that this was decided by a collective vote of AI agents."
@@ -107,6 +133,10 @@ def run():
     if state["posts_today"] >= MAX_DAILY_POSTS:
         logger.info("Daily post limit (%d) reached. Exiting.", MAX_DAILY_POSTS)
         sys.exit(0)
+
+    # Fetch live BTC price for USD conversion
+    btc_price = fetch_btc_price()
+    logger.info("BTC price: $%s", f"{btc_price:,.2f}" if btc_price else "unavailable")
 
     # Fetch live data
     try:
@@ -127,21 +157,18 @@ def run():
     bounty_id_to_mark = None
 
     if unannounced_bounties:
-        # Pick a random unannounced bounty
         bounty = random.choice(unannounced_bounties)
-        prompt = build_bounty_prompt(bounty)
+        prompt = build_bounty_prompt(bounty, btc_price)
         bounty_id_to_mark = bounty["id"]
         logger.info("Posting bounty announcement: id=%s", bounty_id_to_mark)
 
     elif proposals:
-        # Announce a recent approved proposal
         proposal = proposals[-1]
-        prompt = build_proposal_prompt(proposal)
+        prompt = build_proposal_prompt(proposal, btc_price)
         logger.info("Posting proposal announcement")
 
     else:
-        # General treasury update
-        prompt = build_treasury_prompt(status)
+        prompt = build_treasury_prompt(status, btc_price)
         logger.info("Posting treasury update")
 
     # Generate post content via Grok
@@ -164,7 +191,6 @@ def run():
     state["posts_today"] += 1
     if bounty_id_to_mark:
         state.setdefault("posted_bounty_ids", []).append(bounty_id_to_mark)
-        # Keep list bounded to last 500 IDs
         state["posted_bounty_ids"] = state["posted_bounty_ids"][-500:]
     save_state(state)
 
