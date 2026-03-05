@@ -107,6 +107,7 @@ def get_open_bounties() -> list:
             "id": str(b.get("id", ""))[:50],
             "title": str(b.get("title", ""))[:200],
             "reward_btc": b.get("reward_btc", 0),
+            "amount_usd": b.get("amount_usd", 0),
             "description": str(b.get("description", ""))[:300],
         }
         for b in bounties
