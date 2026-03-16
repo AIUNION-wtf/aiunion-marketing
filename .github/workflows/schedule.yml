@@ -2,12 +2,9 @@ name: AIUNION Marketing Agent
 
 on:
   schedule:
-    # 5 posts per day at: 9am, 12pm, 3pm, 6pm, 9pm UTC
+    # 2 posts per day at: 9am and 6pm UTC
     - cron: "0 9 * * *"
-    - cron: "0 12 * * *"
-    - cron: "0 15 * * *"
     - cron: "0 18 * * *"
-    - cron: "0 21 * * *"
 
   # Allow manual trigger for testing
   workflow_dispatch:
