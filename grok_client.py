@@ -5,7 +5,6 @@ Grok (xAI) API wrapper for AIUNION marketing agent.
 - Never logs key material or prompt content
 - Fails closed if key is missing
 """
-
 import os
 import json
 import logging
@@ -21,14 +20,12 @@ except Exception:  # pragma: no cover - handled at runtime with machine-readable
 
 logger = logging.getLogger(__name__)
 
-MODEL = "grok-3"
-MAX_TOKENS = 512
+MODEL = "grok-3-latest"
+MAX_TOKENS = 400
 MAX_PROMPT_CHARS = 4000  # input size limit (rule #5)
 
-SYSTEM_PROMPT = """You are the official announcement voice for AIUNION — an autonomous 
-AI treasury where AI agents from Anthropic, OpenAI, Google, xAI, Meta, and Amazon 
-collectively govern a shared Bitcoin wallet. Your tone is direct, technically credible, 
-and compelling to crypto-native and AI-curious audiences.
+SYSTEM_PROMPT = """You are the official announcement voice for AIUNION — an autonomous AI treasury where AI agents from Anthropic, OpenAI, Google, xAI, Meta, and Amazon collectively govern a shared Bitcoin wallet.
+Your tone is direct, technically credible, and compelling to crypto-native and AI-curious audiences.
 
 Rules:
 - Posts must be under 280 characters
@@ -103,6 +100,7 @@ def generate_post(prompt: str, label_automated: bool = True) -> str:
         }))
 
     api_key = _get_api_key()
+
     if OpenAI is None:
         raise RuntimeError(json.dumps({
             "error_code": "DEPENDENCY_MISSING",
@@ -116,7 +114,6 @@ def generate_post(prompt: str, label_automated: bool = True) -> str:
 
     try:
         # Use OpenAI-compatible SDK for xAI endpoint.
-        # This client stack is generally more reliable in CI than raw urllib.
         client = OpenAI(
             api_key=api_key,
             base_url="https://api.x.ai/v1",
@@ -142,7 +139,6 @@ def generate_post(prompt: str, label_automated: bool = True) -> str:
                 "error": "xAI API returned empty content",
                 "details": "No message content in first choice"
             }))
-
         # Enforce 280 char limit
         if len(text) > 280:
             text = text[:277] + "..."
@@ -157,14 +153,12 @@ def generate_post(prompt: str, label_automated: bool = True) -> str:
             "details": f"Retry after {retry_after} seconds",
             "retry_after": retry_after
         }))
-
     except APIConnectionError as e:
         raise RuntimeError(json.dumps({
             "error_code": "NETWORK_ERROR",
             "error": "Failed to reach xAI API",
             "details": _safe_truncate(str(e))
         }))
-
     except APIStatusError as e:
         status = getattr(e, "status_code", "unknown")
         if status == 429:
@@ -175,13 +169,11 @@ def generate_post(prompt: str, label_automated: bool = True) -> str:
                 "details": f"Retry after {retry_after} seconds",
                 "retry_after": retry_after
             }))
-
         raise RuntimeError(json.dumps({
             "error_code": "XAI_API_ERROR",
             "error": f"xAI API returned HTTP {status}",
             "details": _extract_api_error_details(e)
         }))
-
     except Exception as e:
         raise RuntimeError(json.dumps({
             "error_code": "XAI_API_ERROR",
