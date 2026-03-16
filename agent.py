@@ -38,7 +38,7 @@ logging.basicConfig(
 logger = logging.getLogger("aiunion.agent")
 
 STATE_FILE = Path("state.json")  # tracked in .gitignore
-MAX_DAILY_POSTS = 5
+MAX_DAILY_POSTS = 2
 
 # ── Action weight table ───────────────────────────────────────────────────────────────
 # Weights must sum to 100
