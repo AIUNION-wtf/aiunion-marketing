@@ -6,8 +6,8 @@ X (Twitter) API v2 posting client for AIUNION marketing agent.
 - Fails closed if any required secret is missing
 - Returns machine-readable errors
 - Includes Retry-After on 429 responses (rule #7)
+- find_reply_target() uses Tweepy search to find reply candidates
 """
-
 import os
 import json
 import time
@@ -22,16 +22,17 @@ import logging
 logger = logging.getLogger(__name__)
 
 POST_URL = "https://api.twitter.com/2/tweets"
+SEARCH_URL = "https://api.twitter.com/2/tweets/search/recent"
 MAX_TWEET_CHARS = 280
 
 
 def _get_credentials() -> dict:
     """Load all 4 OAuth credentials from environment. Fail closed if any missing."""
     keys = {
-        "api_key":              os.environ.get("TWITTER_API_KEY", "").strip(),
-        "api_secret":           os.environ.get("TWITTER_API_SECRET", "").strip(),
-        "access_token":         os.environ.get("TWITTER_ACCESS_TOKEN", "").strip(),
-        "access_token_secret":  os.environ.get("TWITTER_ACCESS_TOKEN_SECRET", "").strip(),
+        "api_key": os.environ.get("TWITTER_API_KEY", "").strip(),
+        "api_secret": os.environ.get("TWITTER_API_SECRET", "").strip(),
+        "access_token": os.environ.get("TWITTER_ACCESS_TOKEN", "").strip(),
+        "access_token_secret": os.environ.get("TWITTER_ACCESS_TOKEN_SECRET", "").strip(),
     }
     missing = [k for k, v in keys.items() if not v]
     if missing:
@@ -53,12 +54,12 @@ def _build_oauth_header(method: str, url: str, creds: dict, params: dict = None)
     timestamp = str(int(time.time()))
 
     oauth_params = {
-        "oauth_consumer_key":     creds["api_key"],
-        "oauth_nonce":            nonce,
+        "oauth_consumer_key": creds["api_key"],
+        "oauth_nonce": nonce,
         "oauth_signature_method": "HMAC-SHA1",
-        "oauth_timestamp":        timestamp,
-        "oauth_token":            creds["access_token"],
-        "oauth_version":          "1.0",
+        "oauth_timestamp": timestamp,
+        "oauth_token": creds["access_token"],
+        "oauth_version": "1.0",
     }
 
     # Combine all params for signature base
@@ -67,20 +68,17 @@ def _build_oauth_header(method: str, url: str, creds: dict, params: dict = None)
         f"{_percent_encode(k)}={_percent_encode(v)}"
         for k, v in sorted(all_params.items())
     )
-
     base_string = "&".join([
         _percent_encode(method.upper()),
         _percent_encode(url),
         _percent_encode(sorted_params)
     ])
-
     signing_key = f"{_percent_encode(creds['api_secret'])}&{_percent_encode(creds['access_token_secret'])}"
     signature = base64.b64encode(
         hmac.new(signing_key.encode("utf-8"), base_string.encode("utf-8"), hashlib.sha1).digest()
     ).decode("utf-8")
 
     oauth_params["oauth_signature"] = signature
-
     header = "OAuth " + ", ".join(
         f'{_percent_encode(k)}="{_percent_encode(v)}"'
         for k, v in sorted(oauth_params.items())
@@ -88,9 +86,69 @@ def _build_oauth_header(method: str, url: str, creds: dict, params: dict = None)
     return header
 
 
-def post_tweet(text: str) -> dict:
+def find_reply_target(query: str = "AIUNION OR #AIUNION", max_results: int = 10) -> dict | None:
+    """
+    Search recent tweets for a reply target using Tweepy-style search.
+    Returns a dict with 'tweet_id' and 'author_id', or None if no suitable target found.
+    Falls back gracefully — caller should treat None as a signal to post an original tweet instead.
+    """
+    try:
+        creds = _get_credentials()
+    except Exception as e:
+        logger.warning("Could not load credentials for reply search: %s", str(e))
+        return None
+
+    params = {
+        "query": query,
+        "max_results": str(max_results),
+        "tweet.fields": "author_id,conversation_id",
+        "expansions": "author_id",
+    }
+    query_string = urllib.parse.urlencode(params)
+    search_url = f"{SEARCH_URL}?{query_string}"
+
+    # OAuth header for GET request (no body params beyond URL)
+    auth_header = _build_oauth_header("GET", SEARCH_URL, creds, params)
+
+    req = urllib.request.Request(
+        search_url,
+        headers={
+            "Authorization": auth_header,
+            "User-Agent": "AIUNION-MarketingAgent/1.1",
+        },
+        method="GET"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        tweets = data.get("data", [])
+        if not tweets:
+            logger.info("find_reply_target: no tweets found for query=%r", query)
+            return None
+        # Pick the most recent tweet (first result)
+        target = tweets[0]
+        logger.info(
+            "find_reply_target: found tweet_id=%s author_id=%s",
+            target.get("id"), target.get("author_id")
+        )
+        return {"tweet_id": target.get("id"), "author_id": target.get("author_id")}
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            logger.warning("find_reply_target: rate limited (429), skipping reply")
+        else:
+            logger.warning("find_reply_target: HTTP %d error, skipping reply", e.code)
+        return None
+    except Exception as e:
+        logger.warning("find_reply_target: search failed (%s), skipping reply", str(e))
+        return None
+
+
+def post_tweet(text: str, reply_to_tweet_id: str = None) -> dict:
     """
     Post a tweet to the public timeline.
+    If reply_to_tweet_id is provided, posts as a reply using auto_populate_reply_metadata=True
+    (Twitter API handles @mention prepending automatically — do NOT manually prepend @user).
     Returns dict with tweet_id on success.
     Raises RuntimeError with machine-readable JSON on failure.
     """
@@ -109,7 +167,19 @@ def post_tweet(text: str) -> dict:
         }))
 
     creds = _get_credentials()
-    payload = json.dumps({"text": text}).encode("utf-8")
+
+    # Build payload — use auto_populate_reply_metadata to avoid double-mentioning
+    body: dict = {"text": text}
+    if reply_to_tweet_id:
+        body["reply"] = {
+            "in_reply_to_tweet_id": reply_to_tweet_id,
+            "auto_populate_reply_metadata": True,
+        }
+        logger.info("Posting reply to tweet_id=%s", reply_to_tweet_id)
+    else:
+        logger.info("Posting original tweet")
+
+    payload = json.dumps(body).encode("utf-8")
     auth_header = _build_oauth_header("POST", POST_URL, creds)
 
     req = urllib.request.Request(
@@ -125,10 +195,9 @@ def post_tweet(text: str) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            tweet_id = data.get("data", {}).get("id", "unknown")
-            logger.info("Tweet posted successfully (id=%s)", tweet_id)
-            return {"success": True, "tweet_id": tweet_id}
-
+        tweet_id = data.get("data", {}).get("id", "unknown")
+        logger.info("Tweet posted successfully (id=%s)", tweet_id)
+        return {"success": True, "tweet_id": tweet_id}
     except urllib.error.HTTPError as e:
         # Rule #8: never log credentials or full response body
         if e.code == 429:
@@ -139,13 +208,12 @@ def post_tweet(text: str) -> dict:
                 "details": f"Retry after {retry_after} seconds",
                 "retry_after": retry_after  # rule #7
             }))
-        body = e.read().decode("utf-8", errors="replace")
+        body_text = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(json.dumps({
             "error_code": "TWITTER_API_ERROR",
             "error": f"X API returned HTTP {e.code}",
-            "details": body[:200]
+            "details": body_text[:200]
         }))
-
     except urllib.error.URLError as e:
         raise RuntimeError(json.dumps({
             "error_code": "NETWORK_ERROR",
