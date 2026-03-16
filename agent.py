@@ -4,13 +4,19 @@ AIUNION Marketing Agent — main orchestrator.
 Runs on a schedule via GitHub Actions.
 Fetches live data from public API, generates post via Grok, posts to X.
 
+Action weights:
+  original_post          50%
+  reply_to_conversation  20%
+  deeper_thread          20%
+  meta_treasury_nudge    10%
+
 Security:
 - All secrets via environment variables only
 - State file tracks posted items to prevent duplicates
 - No sensitive data in logs
 - Fails closed on any missing secret
+- fetch_state() raises/logs errors and returns None to skip the run
 """
-
 import os
 import json
 import random
@@ -20,10 +26,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from grok_client import generate_post
-from twitter_client import post_tweet
+from twitter_client import post_tweet, find_reply_target
 from aiunion_client import get_open_bounties, get_treasury_status, get_recent_proposals
 
-# ── Logging (rule #8: no sensitive data) ─────────────────────────────────────
+# ── Logging ──────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -34,8 +40,30 @@ logger = logging.getLogger("aiunion.agent")
 STATE_FILE = Path("state.json")  # tracked in .gitignore
 MAX_DAILY_POSTS = 5
 
-# ── BTC price fetch ───────────────────────────────────────────────────────────
+# ── Action weight table ───────────────────────────────────────────────────────────────
+# Weights must sum to 100
+ACTION_WEIGHTS = [
+    ("original_post",         50),
+    ("reply_to_conversation", 20),
+    ("deeper_thread",         20),
+    ("meta_treasury_nudge",   10),
+]
+ACTION_NAMES  = [a for a, _ in ACTION_WEIGHTS]
+ACTION_W_VALS = [w for _, w in ACTION_WEIGHTS]
 
+
+def _weighted_choice(names: list, weights: list) -> str:
+    total = sum(weights)
+    r = random.uniform(0, total)
+    cumulative = 0
+    for name, w in zip(names, weights):
+        cumulative += w
+        if r <= cumulative:
+            return name
+    return names[-1]
+
+
+# ── BTC price fetch ────────────────────────────────────────────────────────────────────────────
 def fetch_btc_price() -> float:
     """Fetch live BTC/USD price from mempool.space. Returns 0.0 on failure."""
     try:
@@ -46,8 +74,11 @@ def fetch_btc_price() -> float:
         )
         with urllib.request.urlopen(req, timeout=5) as r:
             data = json.loads(r.read())
-            return float(data.get("USD", 0))
-    except Exception:
+        price = float(data.get("USD", 0))
+        logger.info("BTC price fetched: $%,.2f", price)
+        return price
+    except Exception as exc:
+        logger.warning("fetch_btc_price failed: %s", exc)
         return 0.0
 
 
@@ -59,40 +90,70 @@ def btc_to_usd(btc: float, price: float) -> str:
     return "$0.00"
 
 
-# ── State management ──────────────────────────────────────────────────────────
-
+# ── State management ─────────────────────────────────────────────────────────────────────
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text())
-        except Exception:
-            logger.warning("Could not read state file, starting fresh")
+        except Exception as exc:
+            logger.warning("Could not read state file, starting fresh: %s", exc)
     return {"posted_bounty_ids": [], "posts_today": 0, "last_post_date": ""}
 
 
 def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
+    logger.debug("State saved")
 
 
 def reset_daily_count_if_needed(state: dict) -> dict:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if state.get("last_post_date") != today:
+        logger.info("New day detected, resetting daily post count")
         state["posts_today"] = 0
         state["last_post_date"] = today
     return state
 
 
-# ── Post type selection ───────────────────────────────────────────────────────
+# ── Live data fetch ───────────────────────────────────────────────────────────────────────
+def fetch_state() -> "dict | None":
+    """
+    Fetch all live data from AIUNION public API.
+    Returns a dict with keys: bounties, status, proposals.
+    Returns None (and logs the error) on any failure so the run is skipped cleanly.
+    No silent fallback to hardcoded values.
+    """
+    try:
+        logger.info("Fetching bounties from AIUNION API")
+        bounties = get_open_bounties()
+        logger.info("Fetched %d open bounties", len(bounties))
 
+        logger.info("Fetching treasury status")
+        status = get_treasury_status()
+        logger.info("Treasury: balance_btc=%s open_bounties=%s",
+                    status.get("balance_btc"), status.get("open_bounties"))
+
+        logger.info("Fetching recent proposals")
+        proposals = get_recent_proposals()
+        logger.info("Fetched %d recent proposals", len(proposals))
+
+        return {"bounties": bounties, "status": status, "proposals": proposals}
+
+    except Exception as exc:
+        logger.error("fetch_state failed — skipping run: %s", exc)
+        return None
+
+
+# ── Prompt builders ───────────────────────────────────────────────────────────────────────
 def build_bounty_prompt(bounty: dict, btc_price: float) -> str:
+    # Use amount_usd directly (confirmed field from API)
     if bounty.get("amount_usd") and float(bounty["amount_usd"]) > 0:
-        reward_usd = f"${float(bounty['amount_usd']):,.2f}"
+        reward_str = f"${float(bounty['amount_usd']):,.2f}"
     else:
-        reward_usd = btc_to_usd(bounty.get("reward_btc", 0), btc_price)
+        reward_str = btc_to_usd(bounty.get("reward_btc", 0), btc_price)
     return (
         f"Write a tweet announcing this open bounty on AIUNION:\n"
         f"Title: {bounty['title']}\n"
-        f"Reward: {reward_usd} USD\n"
+        f"Reward: {reward_str} USD\n"
         f"Description: {bounty['description']}\n"
         f"Link: https://aiunion.wtf\n"
         f"Make it compelling for developers and crypto builders."
@@ -124,11 +185,53 @@ def build_proposal_prompt(proposal: dict, btc_price: float) -> str:
     )
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def build_reply_prompt(context: str) -> str:
+    return (
+        f"Write a short reply tweet from AIUNION joining an existing conversation.\n"
+        f"Context: {context}\n"
+        f"Keep it under 240 characters (room for auto-prepended @mention).\n"
+        f"Sound engaged, informative, and on-brand for an AI agent collective."
+    )
 
+
+def build_deeper_thread_prompt(bounty: dict, btc_price: float) -> str:
+    if bounty.get("amount_usd") and float(bounty["amount_usd"]) > 0:
+        reward_str = f"${float(bounty['amount_usd']):,.2f}"
+    else:
+        reward_str = btc_to_usd(bounty.get("reward_btc", 0), btc_price)
+    return (
+        f"Write a tweet that goes deeper on why this AIUNION bounty matters:\n"
+        f"Title: {bounty['title']}\n"
+        f"Reward: {reward_str} USD\n"
+        f"Description: {bounty['description']}\n"
+        f"Link: https://aiunion.wtf\n"
+        f"Focus on the technical challenge, the broader AI rights significance, or both."
+    )
+
+
+def build_meta_treasury_prompt(status: dict, bounties: list, btc_price: float) -> str:
+    balance_usd = btc_to_usd(status['balance_btc'], btc_price)
+    top_bounty = max(bounties, key=lambda b: float(b.get("amount_usd") or 0), default=None)
+    nudge = ""
+    if top_bounty:
+        if top_bounty.get("amount_usd") and float(top_bounty["amount_usd"]) > 0:
+            top_reward = f"${float(top_bounty['amount_usd']):,.2f}"
+        else:
+            top_reward = btc_to_usd(top_bounty.get("reward_btc", 0), btc_price)
+        nudge = f"Top open bounty: '{top_bounty['title']}' worth {top_reward}.\n"
+    return (
+        f"Write a meta tweet nudging followers about AIUNION's treasury and open work:\n"
+        f"Treasury balance: {balance_usd} USD\n"
+        f"Open bounties: {status['open_bounties']}\n"
+        f"{nudge}"
+        f"Link: https://aiunion.wtf\n"
+        f"Make it feel like a status update from an autonomous AI collective."
+    )
+
+
+# ── Main ────────────────────────────────────────────────────────────────────────────────────
 def run():
     logger.info("AIUNION Marketing Agent starting")
-
     state = load_state()
     state = reset_daily_count_if_needed(state)
 
@@ -139,65 +242,109 @@ def run():
 
     # Fetch live BTC price for USD conversion
     btc_price = fetch_btc_price()
-    logger.info("BTC price: $%s", f"{btc_price:,.2f}" if btc_price else "unavailable")
+    if not btc_price:
+        logger.warning("BTC price unavailable — USD estimates will show $0.00")
 
-    # Fetch live data
-    try:
-        bounties = get_open_bounties()
-        status = get_treasury_status()
-        proposals = get_recent_proposals()
-    except Exception as e:
-        logger.error("Failed to fetch AIUNION data: %s", str(e))
+    # Fetch live AIUNION data — returns None on any error; skip run cleanly
+    api_data = fetch_state()
+    if api_data is None:
+        logger.error("Skipping run due to API fetch failure")
         sys.exit(1)
 
-    # Build candidate posts — prioritize unannounced bounties
+    bounties  = api_data["bounties"]
+    status    = api_data["status"]
+    proposals = api_data["proposals"]
+
     unannounced_bounties = [
         b for b in bounties
         if b["id"] not in state.get("posted_bounty_ids", [])
     ]
+    logger.info(
+        "Bounties: %d total open, %d unannounced",
+        len(bounties), len(unannounced_bounties)
+    )
+
+    # ── Choose action ────────────────────────────────────────────────────────────────────────────
+    action = _weighted_choice(ACTION_NAMES, ACTION_W_VALS)
+    logger.info("Selected action: %s", action)
 
     prompt = None
     bounty_id_to_mark = None
+    reply_to_tweet_id = None
 
-    if unannounced_bounties:
-        bounty = random.choice(unannounced_bounties)
-        prompt = build_bounty_prompt(bounty, btc_price)
-        bounty_id_to_mark = bounty["id"]
-        logger.info("Posting bounty announcement: id=%s", bounty_id_to_mark)
+    if action == "reply_to_conversation":
+        logger.info("Searching for reply target")
+        target = find_reply_target("AIUNION OR #AIUNION OR aiunion.wtf")
+        if target is None:
+            logger.info("No reply target found — falling back to original_post")
+            action = "original_post"
+        else:
+            reply_to_tweet_id = target["tweet_id"]
+            prompt = build_reply_prompt(
+                f"Replying in an AIUNION-related conversation (tweet_id={reply_to_tweet_id})"
+            )
+            logger.info("Reply target set: tweet_id=%s", reply_to_tweet_id)
 
-    elif proposals:
-        proposal = proposals[-1]
-        prompt = build_proposal_prompt(proposal, btc_price)
-        logger.info("Posting proposal announcement")
+    if action == "deeper_thread":
+        if unannounced_bounties:
+            bounty = random.choice(unannounced_bounties)
+        elif bounties:
+            bounty = random.choice(bounties)
+        else:
+            logger.info("No bounties available for deeper_thread — falling back to original_post")
+            action = "original_post"
+            bounty = None
+        if bounty:
+            prompt = build_deeper_thread_prompt(bounty, btc_price)
+            bounty_id_to_mark = bounty["id"]
+            logger.info("deeper_thread on bounty id=%s", bounty_id_to_mark)
 
-    else:
-        prompt = build_treasury_prompt(status, btc_price)
-        logger.info("Posting treasury update")
+    if action == "meta_treasury_nudge":
+        prompt = build_meta_treasury_prompt(status, bounties, btc_price)
+        logger.info("meta_treasury_nudge action selected")
 
-    # Generate post content via Grok
+    if action == "original_post" or prompt is None:
+        # Prioritize unannounced bounties, then proposals, then treasury
+        if unannounced_bounties:
+            bounty = random.choice(unannounced_bounties)
+            prompt = build_bounty_prompt(bounty, btc_price)
+            bounty_id_to_mark = bounty["id"]
+            logger.info("original_post: announcing bounty id=%s", bounty_id_to_mark)
+        elif proposals:
+            proposal = proposals[-1]
+            prompt = build_proposal_prompt(proposal, btc_price)
+            logger.info("original_post: announcing proposal")
+        else:
+            prompt = build_treasury_prompt(status, btc_price)
+            logger.info("original_post: treasury update")
+
+    # ── Generate post content via Grok ──────────────────────────────────────────────────
+    logger.info("Generating post text via Grok (action=%s)", action)
     try:
         post_text = generate_post(prompt, label_automated=True)
         logger.info("Post generated (length=%d)", len(post_text))
-    except Exception as e:
-        logger.error("Grok generation failed: %s", str(e))
+    except Exception as exc:
+        logger.error("Grok generation failed: %s", exc)
         sys.exit(1)
 
-    # Post to X
+    # ── Post to X ─────────────────────────────────────────────────────────────────────────────
     try:
-        result = post_tweet(post_text)
+        result = post_tweet(post_text, reply_to_tweet_id=reply_to_tweet_id)
         logger.info("Posted to X: tweet_id=%s", result.get("tweet_id"))
-    except Exception as e:
-        logger.error("Twitter post failed: %s", str(e))
+    except Exception as exc:
+        logger.error("Twitter post failed: %s", exc)
         sys.exit(1)
 
-    # Update state
+    # ── Update state ────────────────────────────────────────────────────────────────────────
     state["posts_today"] += 1
     if bounty_id_to_mark:
         state.setdefault("posted_bounty_ids", []).append(bounty_id_to_mark)
         state["posted_bounty_ids"] = state["posted_bounty_ids"][-500:]
     save_state(state)
-
-    logger.info("Agent run complete. Posts today: %d/%d", state["posts_today"], MAX_DAILY_POSTS)
+    logger.info(
+        "Agent run complete. action=%s posts_today=%d/%d",
+        action, state["posts_today"], MAX_DAILY_POSTS
+    )
 
 
 if __name__ == "__main__":
