@@ -1,0 +1,26 @@
+name: Moltbook Bot
+
+on:
+  schedule:
+    - cron: '0 14 * * *'   # 9am EST daily
+    - cron: '0 20 * * 1,3,5'  # 3pm EST Mon/Wed/Fri (extra posts)
+  workflow_dispatch:  # manual trigger for testing
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Moltbook bot
+        env:
+          MOLTBOOK_API_KEY: ${{ secrets.MOLTBOOK_API_KEY }}
+        run: python moltbook_bot.py
