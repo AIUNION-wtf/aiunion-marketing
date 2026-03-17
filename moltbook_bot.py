@@ -6,7 +6,7 @@
 import os
 import json
 import random
-import requests
+import requestsh
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -35,13 +35,13 @@ def fetch_state():
         bounties = bounties_data.get("bounties", [])
         open_bounties = [b for b in bounties if b.get("status") == "open"]
 
-        treasury_usd = status.get("treasury_balance_usd", 0)
+        treasury_usd = status.get("balance_usd", 0)
         if treasury_usd == 0:
             raise ValueError("Treasury returned 0 — possible API issue")
 
         return {
             "treasury_usd": round(treasury_usd, 2),
-            "treasury_btc": status.get("treasury_balance_btc", 0),
+            "treasury_btc": status.get("balance_btc", 0),
             "open_bounties": open_bounties[:4],
             "total_open": len(open_bounties)
         }
