@@ -77,7 +77,7 @@ def fetch_btc_price() -> float:
         with urllib.request.urlopen(req, timeout=5) as r:
             data = json.loads(r.read())
         price = float(data.get("USD", 0))
-        logger.info("BTC price fetched: $%,.2f", price)
+        logger.info("BTC price fetched: $%s", f"{price:,.2f}")
         return price
     except Exception as exc:
         logger.warning("fetch_btc_price failed: %s", exc)
