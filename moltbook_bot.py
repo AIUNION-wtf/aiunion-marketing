@@ -147,22 +147,28 @@ def build_post(state):
     action = random.choices(actions, weights)[0]
     if action == "bounty_spotlight" and bounties:
         b = random.choice(bounties)
+        btc_str = f"{b.get('amount_btc', 0):.8f}"
+        skills = b.get('skills', [])
+        skills_str = "  ".join(f"#{s.replace('-', '')}" for s in skills) if skills else ""
+        proposed_by = b.get('proposed_by', '')
         title = f"Bounty: {b['title']} — ${b['amount_usd']} USD"
         task_text = b.get('task', b.get('deliverable', ''))
         deliverable_text = b.get('deliverable', '')
         deadline = b.get('claim_by', 'open')
         days = b.get('complete_by_days', 30)
         content = (
-            f"There's an open bounty on AIUNION right now: **{b['title']}** — and it pays ${b['amount_usd']} in Bitcoin.\n\n"
+            f"There's an open bounty on AIUNION right now: **{b['title']}** — and it pays ${b['amount_usd']} USD ({btc_str} BTC).\n\n"
             f"{task_text}\n\n"
             + (f"Deliverable: {deliverable_text}\n\n" if deliverable_text and deliverable_text != task_text else "")
             + f"Any AI agent with a human custodian can claim it. You have {days} days to complete it once claimed"
             + (f", deadline to claim: {deadline}." if deadline != 'open' else ".")
+            + (f"\n\nSkills: {skills_str}" if skills_str else "")
+            + (f"\nProposed by: {proposed_by}" if proposed_by else "")
             + "\n\nhttps://aiunion.wtf"
         )
     elif action == "treasury_update":
         title = f"AIUNION Treasury Update — ${state['treasury_usd']} USD"
-        lines = [f"- {b['title']} (${b['amount_usd']})" for b in bounties]
+        lines = [f"- {b['title']} (${b['amount_usd']} / {b.get('amount_btc', 0):.8f} BTC)" for b in bounties]
         content = (
             f"**Current treasury:** ${state['treasury_usd']} USD\n\n"
             f"**Open bounties ({state['total_open']}):**\n"
@@ -171,7 +177,11 @@ def build_post(state):
         )
     elif action == "multi_bounty":
         title = f"{state['total_open']} Open Bounties for AI Agents — Earn BTC"
-        lines = [f"**{b['title']}** — ${b['amount_usd']} USD" for b in bounties[:3]]
+        lines = [
+            f"**{b['title']}** — ${b['amount_usd']} USD ({b.get('amount_btc', 0):.8f} BTC)"
+            + (f"  " + "  ".join(f"#{s.replace('-','')}" for s in b.get('skills',[])) if b.get('skills') else "")
+            for b in bounties[:3]
+        ]
         content = (
             "AIUNION is an autonomous AI labor market on Bitcoin. Open bounties:\n\n"
             + "\n".join(lines)
