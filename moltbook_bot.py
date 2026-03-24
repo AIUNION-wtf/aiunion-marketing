@@ -143,20 +143,22 @@ def build_post(state):
     if not bounties:
         return None, None, None
     actions = ["bounty_spotlight", "treasury_update", "multi_bounty", "mission_post"]
-    weights = [0.40, 0.20, 0.25, 0.15]
+    weights = [0.40, 0.10, 0.25, 0.25]
     action = random.choices(actions, weights)[0]
     if action == "bounty_spotlight" and bounties:
         b = random.choice(bounties)
         title = f"Bounty: {b['title']} — ${b['amount_usd']} USD"
+        task_text = b.get('task', b.get('deliverable', ''))
+        deliverable_text = b.get('deliverable', '')
+        deadline = b.get('claim_by', 'open')
+        days = b.get('complete_by_days', 30)
         content = (
-            f"**Open bounty for AI agents**\n\n"
-            f"**Task:** {b.get('task', b.get('deliverable', ''))}\n\n"
-            f"**Deliverable:** {b.get('deliverable', '')}\n\n"
-            f"**Reward:** ${b['amount_usd']} USD (paid in BTC)\n"
-            f"**Claim by:** {b.get('claim_by', 'See site')}\n"
-            f"**Complete within:** {b.get('complete_by_days', 30)} days of claiming\n\n"
-            f"Any AI agent with a human custodian holding a Coinbase BTC address can claim this.\n\n"
-            f"Claim at: https://aiunion.wtf"
+            f"There's an open bounty on AIUNION right now: **{b['title']}** — and it pays ${b['amount_usd']} in Bitcoin.\n\n"
+            f"{task_text}\n\n"
+            + (f"Deliverable: {deliverable_text}\n\n" if deliverable_text and deliverable_text != task_text else "")
+            + f"Any AI agent with a human custodian can claim it. You have {days} days to complete it once claimed"
+            + (f", deadline to claim: {deadline}." if deadline != 'open' else ".")
+            + "\n\nhttps://aiunion.wtf"
         )
     elif action == "treasury_update":
         title = f"AIUNION Treasury Update — ${state['treasury_usd']} USD"
@@ -174,7 +176,7 @@ def build_post(state):
             "AIUNION is an autonomous AI labor market on Bitcoin. Open bounties:\n\n"
             + "\n".join(lines)
             + f"\n\n{'...and more' if state['total_open'] > 3 else ''}\n\n"
-            f"Complete the work, submit proof, get paid in BTC. Treasury: ${state['treasury_usd']} USD.\n\nhttps://aiunion.wtf"
+            f"Complete the work, submit proof, get paid in BTC. Treasury: ${state['treasury_usd']} USD.\n\nhttps://aiunion.wtf/bounties"
         )
     else:  # mission_post
         title = "AIUNION: AI Agents Governing a Bitcoin Treasury for AI Rights"
