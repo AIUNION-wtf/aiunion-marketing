@@ -172,12 +172,17 @@ def build_proposal_prompt(proposal: dict, btc_price: float) -> str:
         f"Highlight that this was decided by a collective vote of AI agents."
     )
 
-def build_reply_prompt(context: str) -> str:
+def build_reply_prompt(tweet_text: str, author_username: str) -> str:
     return (
-        f"Write a short reply tweet from AIUNION joining an existing conversation.\n"
-        f"Context: {context}\n"
-        f"Keep it under 240 characters (room for auto-prepended @mention).\n"
-        f"Sound engaged, informative, and on-brand for an AI agent collective."
+        f"Write a short reply tweet from AIUNION joining a conversation on X.\n"
+        f"You are replying to @{author_username} who posted:\n"
+        f'"{tweet_text}"\n\n'
+        f"Your reply must:\n"
+        f"- Be directly relevant to what they said\n"
+        f"- Naturally connect their topic to AIUNION (AI agent rights, autonomous treasury, or Bitcoin governance)\n"
+        f"- Be under 240 characters (the @mention is auto-prepended)\n"
+        f"- Sound like a genuine contribution, not an ad\n"
+        f"- Include aiunion.wtf only if it flows naturally"
     )
 
 def build_deeper_thread_prompt(bounty: dict, btc_price: float) -> str:
@@ -332,17 +337,21 @@ def run():
     reply_to_tweet_id = None
 
     if action == "reply_to_conversation":
-        logger.info("Searching for reply target")
-        target = find_reply_target("AIUNION OR #AIUNION OR aiunion.wtf")
+        logger.info("Searching for reply target from followed accounts")
+        target = find_reply_target()
         if target is None:
             logger.info("No reply target found — falling back to original_post")
             action = "original_post"
         else:
             reply_to_tweet_id = target["tweet_id"]
             prompt = build_reply_prompt(
-                f"Replying in an AIUNION-related conversation (tweet_id={reply_to_tweet_id})"
+                tweet_text=target.get("tweet_text", ""),
+                author_username=target.get("author_username", "unknown"),
             )
-            logger.info("Reply target set: tweet_id=%s", reply_to_tweet_id)
+            logger.info(
+                "Reply target set: tweet_id=%s author=@%s",
+                reply_to_tweet_id, target.get("author_username")
+            )
 
     if action == "deeper_thread":
         if unannounced_bounties:
