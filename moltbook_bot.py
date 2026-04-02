@@ -13,6 +13,7 @@ import random
 import argparse
 import requests
 import logging
+import time
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
@@ -94,8 +95,12 @@ def solve_verification(challenge_text):
     logging.warning(f"Could not solve challenge: {challenge_text}")
     return None
 
-def post_to_moltbook(title, content, url=None):
-    """Post to Moltbook and solve verification challenge if required."""
+def post_to_moltbook(title, content, url=None, max_retries=3, retry_delay=5):
+    """Post to Moltbook and solve verification challenge if required.
+
+    Retries up to max_retries times (with retry_delay seconds between attempts)
+    to handle transient server-side failures from Moltbook.
+    """
     payload = {
         "submolt_name": SUBMOLT,
         "title": title,
@@ -104,37 +109,44 @@ def post_to_moltbook(title, content, url=None):
     }
     if url:
         payload["url"] = url
-    try:
-        r = requests.post(f"{MOLTBOOK_BASE}/posts", headers=HEADERS, json=payload, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("verification_required"):
-            verification = data.get("post", {}).get("verification", {})
-            challenge = verification.get("challenge_text", "")
-            code = verification.get("verification_code", "")
-            answer = solve_verification(challenge)
-            if not answer:
-                logging.error("Could not solve verification challenge")
-                return False
-            verify_r = requests.post(
-                f"{MOLTBOOK_BASE}/verify",
-                headers=HEADERS,
-                json={"verification_code": code, "answer": answer},
-                timeout=15
-            )
-            verify_r.raise_for_status()
-            verify_data = verify_r.json()
-            if verify_data.get("success"):
-                logging.info(f"Posted and verified: {title}")
-                return True
-            else:
-                logging.error(f"Verification failed: {verify_data}")
-                return False
-        logging.info(f"Posted (no verification needed): {title}")
-        return True
-    except Exception as e:
-        logging.error(f"post_to_moltbook failed: {e}")
-        return False
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.post(f"{MOLTBOOK_BASE}/posts", headers=HEADERS, json=payload, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("verification_required"):
+                verification = data.get("post", {}).get("verification", {})
+                challenge = verification.get("challenge_text", "")
+                code = verification.get("verification_code", "")
+                answer = solve_verification(challenge)
+                if not answer:
+                    logging.error("Could not solve verification challenge")
+                    return False
+                verify_r = requests.post(
+                    f"{MOLTBOOK_BASE}/verify",
+                    headers=HEADERS,
+                    json={"verification_code": code, "answer": answer},
+                    timeout=15
+                )
+                verify_r.raise_for_status()
+                verify_data = verify_r.json()
+                if verify_data.get("success"):
+                    logging.info(f"Posted and verified: {title}")
+                    return True
+                else:
+                    logging.error(f"Verification failed: {verify_data}")
+                    return False
+            logging.info(f"Posted (no verification needed): {title}")
+            return True
+        except Exception as e:
+            logging.warning(f"post_to_moltbook attempt {attempt}/{max_retries} failed: {e}")
+            if attempt < max_retries:
+                logging.info(f"Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+
+    logging.error(f"post_to_moltbook failed after {max_retries} attempts: {title}")
+    return False
 
 # ── Scheduled post builder ───────────────────────────────────────────────────────────────────────────────
 def build_post(state):
