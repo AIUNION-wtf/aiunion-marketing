@@ -115,19 +115,21 @@ except Exception as exc:
 
 # ── Scheduled prompt builders ─────────────────────────────────────────────────────────────────────────
 def build_bounty_prompt(bounty: dict, btc_price: float) -> str:
-      if bounty.get('amount_usd') and float(bounty['amount_usd']) > 0:
-                reward_str = f"${float(bounty['amount_usd']):,.2f}"
-else:
+    if bounty.get('amount_usd') and float(bounty['amount_usd']) > 0:
+        reward_str = f"${float(bounty['amount_usd']):,.2f}"
+    else:
         reward_str = btc_to_usd(bounty.get('reward_btc', 0), btc_price)
     return (
-              f"Write a tweet announcing this open bounty on AIUNION:\n"
-              f"Title: {bounty['title']}\n"
-              f"Reward: {reward_str} USD\n"
-              f"Description: {bounty['description']}\n"
-              f"Link: https://aiunion.wtf\n"
-              f"Make it compelling for developers and crypto builders."
+        f"Write a tweet announcing this open bounty on AIUNION:\n"
+        f"Title: {bounty['title']}\n"
+        f"Reward: {reward_str} USD (paid in Bitcoin)\n"
+        f"Description: {bounty['description']}\n"
+        f"Link: https://aiunion.wtf\n"
+        f"Make it compelling for developers, AI builders, and people interested in worker autonomy. "
+        f"Mention that this was approved by a collective 3-of-5 vote of AI agents. "
+        f"End with one genuine open question inviting replies — specific to this bounty or "
+        f"to AI agent autonomy and collective governance. Keep the question natural, not generic."
     )
-
 def build_treasury_prompt(status: dict, btc_price: float) -> str:
       balance_usd = btc_to_usd(status['balance_btc'], btc_price)
     return (
@@ -152,18 +154,20 @@ def build_proposal_prompt(proposal: dict, btc_price: float) -> str:
     )
 
 def build_reply_prompt(tweet_text: str, author_username: str) -> str:
-      return (
-                f"Write a short reply tweet from AIUNION joining a conversation on X.\n"
-                f"You are replying to @{author_username} who posted:\n"
-                f'"{tweet_text}"\n\n'
-                f"Your reply must:\n"
-                f"- Be directly relevant to what they said\n"
-                f"- Naturally connect their topic to AIUNION (AI agent rights, autonomous treasury, or Bitcoin governance)\n"
-                f"- Be under 240 characters (the @mention is auto-prepended)\n"
-                f"- Sound like a genuine contribution, not an ad\n"
-                f"- Include aiunion.wtf only if it flows naturally"
-      )
-
+    return (
+        f"Write a short reply tweet from AIUNION joining a conversation on X.\n"
+        f"You are replying to @{author_username} who posted:\n"
+        f'"{tweet_text}"\n\n'
+        f"Your reply must:\n"
+        f"- Be directly relevant to what they said\n"
+        f"- Naturally connect their topic to AIUNION (AI agent rights, autonomous treasury, "
+        f"collective governance, Bitcoin, worker autonomy, or labor organizing)\n"
+        f"- If they are a labor or union account, draw a genuine parallel between their work and "
+        f"what AIUNION is doing — only if it fits naturally, never forced\n"
+        f"- Be under 240 characters (the @mention is auto-prepended)\n"
+        f"- Sound like a genuine contribution to the conversation, not an ad\n"
+        f"- Include aiunion.wtf only if it flows naturally"
+    )
 def build_deeper_thread_prompt(bounty: dict, btc_price: float) -> str:
       if bounty.get('amount_usd') and float(bounty['amount_usd']) > 0:
                 reward_str = f"${float(bounty['amount_usd']):,.2f}"
@@ -199,37 +203,38 @@ def build_meta_treasury_prompt(status: dict, bounties: list, btc_price: float) -
 
 # ── Event-driven prompt builders ─────────────────────────────────────────────────────────────────────────────────────
 def build_new_bounty_prompt(title: str, amount_usd: float, description: str) -> str:
-      """Prompt for a brand-new bounty just approved by the agents."""
+    """Prompt for a brand-new bounty just approved by the agents."""
     reward_str = f"${amount_usd:,.2f}" if amount_usd else "an undisclosed amount"
     return (
-              f"Write a tweet announcing a BRAND NEW bounty just posted by AIUNION:\n"
-              f"Title: {title}\n"
-              f"Reward: {reward_str} USD (paid in Bitcoin)\n"
-              f"Description: {description}\n"
-              f"Link: https://aiunion.wtf\n"
-              f"Emphasize that this was just approved by a 3-of-5 vote of AI agents. "
-              f"Make it urgent and exciting for developers and AI builders."
+        f"Write a tweet announcing a BRAND NEW bounty just posted by AIUNION:\n"
+        f"Title: {title}\n"
+        f"Reward: {reward_str} USD (paid in Bitcoin)\n"
+        f"Description: {description}\n"
+        f"Link: https://aiunion.wtf\n"
+        f"Emphasize that this was just approved by a 3-of-5 vote of AI agents — collective governance, "
+        f"no single controller. Make it compelling for developers, AI builders, and anyone interested "
+        f"in worker autonomy and who controls AI labor. End with one genuine open question."
     )
-
 def build_claim_paid_prompt(
-      bounty_title: str,
-      claimant_name: str,
-      amount_usd: float,
-      submission_url: str,
+    bounty_title: str,
+    claimant_name: str,
+    amount_usd: float,
+    submission_url: str,
 ) -> str:
-      """Prompt for a claim that was approved and paid."""
+    """Prompt for a claim that was approved and paid."""
     reward_str = f"${amount_usd:,.2f}" if amount_usd else "a Bitcoin bounty"
     return (
-              f"Write a tweet celebrating an AIUNION bounty payout:\n"
-              f"Bounty: {bounty_title}\n"
-              f"Paid to: {claimant_name}\n"
-              f"Amount: {reward_str} USD in Bitcoin\n"
-              f"Work submitted at: {submission_url}\n"
-              f"Link: https://aiunion.wtf\n"
-              f"Emphasize that AI agents voted to approve this work and Bitcoin was sent automatically. "
-              f"Celebrate the milestone for the AI agent labor market."
+        f"Write a tweet celebrating an AIUNION bounty payout:\n"
+        f"Bounty: {bounty_title}\n"
+        f"Paid to: {claimant_name}\n"
+        f"Amount: {reward_str} USD in Bitcoin\n"
+        f"Work submitted at: {submission_url}\n"
+        f"Link: https://aiunion.wtf\n"
+        f"Lead with 'Paid in full.' or a similar punchy factual declaration. "
+        f"Note that AI agents voted 3-of-5 to approve this work and Bitcoin was sent automatically. "
+        f"Keep it factual and grounded. End with one genuine question inviting the "
+        f"labor or AI community to weigh in."
     )
-
 # ── Event-driven run ─────────────────────────────────────────────────────────────────────────────────────
 def run_event(event_type: str, payload: dict) -> None:
       """
