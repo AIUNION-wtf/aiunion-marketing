@@ -38,6 +38,11 @@ REPLY_TOPICS = [
     "bitcoin multisig",
     "DAO treasury",
     "AI personhood",
+    "worker autonomy",
+    "labor rights",
+    "collective bargaining",
+    "worker owned",
+    "AI workers",
 ]
 
 
