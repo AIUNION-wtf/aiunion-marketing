@@ -1,6 +1,6 @@
 """
 grok_client.py
-Grok (xAI) API wrapper for AIUNION marketing agent.
+Grok (via OpenRouter) API wrapper for AIUNION marketing agent.
 - Reads API key from environment only, never from arguments or files
 - Never logs key material or prompt content
 - Fails closed if key is missing
@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover - handled at runtime with machine-readable
 
 logger = logging.getLogger(__name__)
 
-MODEL = "grok-3-latest"
+MODEL = "x-ai/grok-4.20"
 MAX_TOKENS = 400
 MAX_PROMPT_CHARS = 4000  # input size limit (rule #5)
 
@@ -44,13 +44,13 @@ Rules:
 
 
 def _get_api_key() -> str:
-    """Fail closed if XAI_API_KEY is missing."""
-    key = os.environ.get("XAI_API_KEY", "").strip()
+    """Fail closed if AIUNION_OPENROUTER_API_KEY is missing."""
+    key = os.environ.get("AIUNION_OPENROUTER_API_KEY", "").strip()
     if not key:
         raise EnvironmentError(json.dumps({
             "error_code": "MISSING_SECRET",
-            "error": "XAI_API_KEY environment variable not set",
-            "details": "Set XAI_API_KEY in GitHub Actions secrets or local .env"
+            "error": "AIUNION_OPENROUTER_API_KEY environment variable not set",
+            "details": "Set AIUNION_OPENROUTER_API_KEY in GitHub Actions secrets or local .env"
         }))
     return key
 
@@ -120,10 +120,10 @@ def generate_post(prompt: str, label_automated: bool = True) -> str:
         user_content += "\n\nEnd the post with [AUTO]"
 
     try:
-        # Use OpenAI-compatible SDK for xAI endpoint.
+        # Use OpenAI-compatible SDK for OpenRouter endpoint.
         client = OpenAI(
             api_key=api_key,
-            base_url="https://api.x.ai/v1",
+            base_url="https://openrouter.ai/api/v1",
             timeout=30.0,
             max_retries=1,
             default_headers={
