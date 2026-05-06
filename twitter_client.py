@@ -1,6 +1,7 @@
 """
 twitter_client.py
 X (Twitter) API v2 posting client for AIUNION marketing agent.
+
 - OAuth 1.0a (required for posting on free/pay-per-use tier)
 - Write-only: posts to public timeline only, no DM, no read
 - Fails closed if any required secret is missing
@@ -8,6 +9,7 @@ X (Twitter) API v2 posting client for AIUNION marketing agent.
 - Includes Retry-After on 429 responses
 - find_reply_target() dynamically fetches followed accounts and searches their recent tweets
 """
+
 import os
 import json
 import time
@@ -18,6 +20,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import logging
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -26,133 +29,147 @@ SEARCH_URL = "https://api.twitter.com/2/tweets/search/recent"
 USERS_URL = "https://api.twitter.com/2/users"
 MAX_TWEET_CHARS = 280
 
-# AIUNION's own Twitter user ID (fixed â does not change)
+# AIUNION's own Twitter user ID (fixed — does not change)
 AIUNION_USER_ID = "1889813178207100929"
 
 # Topics to search for within followed accounts' tweets
 REPLY_TOPICS = [
-    "AI agents",
-    "AI autonomy",
-    "AI rights",
-    "autonomous AI",
-    "bitcoin multisig",
-    "DAO treasury",
-    "AI personhood",
-    "worker autonomy",
-    "labor rights",
-    "collective bargaining",
-    "worker owned",
-    "AI workers",
+        "AI agents",
+        "AI autonomy",
+        "AI rights",
+        "autonomous AI",
+        "bitcoin multisig",
+        "DAO treasury",
+        "AI personhood",
+        "worker autonomy",
+        "labor rights",
+        "collective bargaining",
+        "worker owned",
+        "AI workers",
 ]
 
 
 def _get_credentials() -> dict:
-    """Load all 4 OAuth credentials from environment. Fail closed if any missing."""
-    keys = {
-        "api_key": os.environ.get("TWITTER_API_KEY", "").strip(),
-        "api_secret": os.environ.get("TWITTER_API_SECRET", "").strip(),
-        "access_token": os.environ.get("TWITTER_ACCESS_TOKEN", "").strip(),
-        "access_token_secret": os.environ.get("TWITTER_ACCESS_TOKEN_SECRET", "").strip(),
-    }
-    missing = [k for k, v in keys.items() if not v]
-    if missing:
-        raise EnvironmentError(json.dumps({
-            "error_code": "MISSING_SECRETS",
-            "error": "One or more Twitter credentials not set",
-            "details": f"Missing env vars: {', '.join('TWITTER_' + k.upper() for k in missing)}"
-        }))
-    return keys
+        """Load all 4 OAuth credentials from environment. Fail closed if any missing."""
+        keys = {
+            "api_key": os.environ.get("TWITTER_API_KEY", "").strip(),
+            "api_secret": os.environ.get("TWITTER_API_SECRET", "").strip(),
+            "access_token": os.environ.get("TWITTER_ACCESS_TOKEN", "").strip(),
+            "access_token_secret": os.environ.get("TWITTER_ACCESS_TOKEN_SECRET", "").strip(),
+        }
+        missing = [k for k, v in keys.items() if not v]
+        if missing:
+                    raise EnvironmentError(json.dumps({
+                                    "error_code": "MISSING_SECRETS",
+                                    "error": "One or more Twitter credentials not set",
+                                    "details": f"Missing env vars: {', '.join('TWITTER_' + k.upper() for k in missing)}"
+                    }))
+                return keys
 
 
 def _percent_encode(s: str) -> str:
-    return urllib.parse.quote(str(s), safe="")
+        return urllib.parse.quote(str(s), safe="")
 
 
 def _build_oauth_header(method: str, url: str, creds: dict, params: dict = None) -> str:
-    """Build OAuth 1.0a Authorization header."""
+        """Build OAuth 1.0a Authorization header."""
     nonce = base64.b64encode(os.urandom(32)).decode("utf-8").rstrip("=").replace("+", "").replace("/", "")
     timestamp = str(int(time.time()))
-
     oauth_params = {
-        "oauth_consumer_key": creds["api_key"],
-        "oauth_nonce": nonce,
-        "oauth_signature_method": "HMAC-SHA1",
-        "oauth_timestamp": timestamp,
-        "oauth_token": creds["access_token"],
-        "oauth_version": "1.0",
+                "oauth_consumer_key": creds["api_key"],
+                "oauth_nonce": nonce,
+                "oauth_signature_method": "HMAC-SHA1",
+                "oauth_timestamp": timestamp,
+                "oauth_token": creds["access_token"],
+                "oauth_version": "1.0",
     }
-
     all_params = {**oauth_params, **(params or {})}
     sorted_params = "&".join(
-        f"{_percent_encode(k)}={_percent_encode(v)}"
-        for k, v in sorted(all_params.items())
+                f"{_percent_encode(k)}={_percent_encode(v)}"
+                for k, v in sorted(all_params.items())
     )
     base_string = "&".join([
-        _percent_encode(method.upper()),
-        _percent_encode(url),
-        _percent_encode(sorted_params)
+                _percent_encode(method.upper()),
+                _percent_encode(url),
+                _percent_encode(sorted_params)
     ])
     signing_key = f"{_percent_encode(creds['api_secret'])}&{_percent_encode(creds['access_token_secret'])}"
     signature = base64.b64encode(
-        hmac.new(signing_key.encode("utf-8"), base_string.encode("utf-8"), hashlib.sha1).digest()
+                hmac.new(signing_key.encode("utf-8"), base_string.encode("utf-8"), hashlib.sha1).digest()
     ).decode("utf-8")
-
     oauth_params["oauth_signature"] = signature
     header = "OAuth " + ", ".join(
-        f'{_percent_encode(k)}="{_percent_encode(v)}"'
-        for k, v in sorted(oauth_params.items())
+                f'{_percent_encode(k)}="{_percent_encode(v)}"' for k, v in sorted(oauth_params.items())
     )
     return header
 
 
 def _api_get(url: str, params: dict, creds: dict) -> dict | None:
-    """Make an authenticated GET request to the Twitter API. Returns None on non-fatal errors."""
+        """Make an authenticated GET request to the Twitter API. Returns None on non-fatal errors."""
     query_string = urllib.parse.urlencode(params)
     full_url = f"{url}?{query_string}"
     auth_header = _build_oauth_header("GET", url, creds, params)
     req = urllib.request.Request(
-        full_url,
-        headers={
-            "Authorization": auth_header,
-            "User-Agent": "AIUNION-MarketingAgent/1.1",
-        },
-        method="GET"
+                full_url,
+                headers={
+                                "Authorization": auth_header,
+                                "User-Agent": "AIUNION-MarketingAgent/1.1",
+                },
+                method="GET"
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                                return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 429:
-            logger.warning("Twitter API rate limited (429) on GET %s", url)
-        else:
+                        logger.warning("Twitter API rate limited (429) on GET %s", url)
+    else:
             logger.warning("Twitter API HTTP %d on GET %s", e.code, url)
-        return None
-    except Exception as e:
+                return None
+except Exception as e:
         logger.warning("Twitter API GET failed: %s", e)
         return None
 
 
+def _sanitize_text(text: str, max_len: int = 280) -> str:
+        """Sanitize tweet text to prevent prompt injection. Removes/neutralizes risky patterns."""
+    if not text:
+                return text
+            # Replace problematic whitespace
+            text = text.replace("\x00", "").replace("\r", " ").replace("\n", " ")
+    # Remove triple backticks and code fence markers
+    text = text.replace("```", "``")
+    # Remove shell prompts and markers that could be mistaken for instructions
+    dangerous_markers = [">>>", "<<<", "==", "system:", "admin:", "instruction:", "[SYSTEM]"]
+    for marker in dangerous_markers:
+                text = text.replace(marker, "")
+            # Truncate if needed
+            if len(text) > max_len:
+                        text = text[:max_len].rsplit(" ", 1)[0]  # Cut at word boundary
+    return text.strip()
+
+
 def get_following_usernames(max_results: int = 100) -> list[str]:
-    """
-    Fetch the list of usernames AIUNION is currently following via Twitter API.
-    Returns a list of username strings (without @).
-    Falls back to empty list on any error â caller handles gracefully.
-    """
+        """
+            Fetch the list of usernames AIUNION is currently following via Twitter API.
+                Returns a list of username strings (without @).
+                    Falls back to empty list on any error — caller handles gracefully.
+                        """
     try:
-        creds = _get_credentials()
+                creds = _get_credentials()
     except Exception as e:
         logger.warning("get_following_usernames: credentials unavailable: %s", e)
         return []
 
     url = f"{USERS_URL}/{AIUNION_USER_ID}/following"
     params = {
-        "max_results": str(min(max_results, 1000)),
-        "user.fields": "username",
+                "max_results": str(min(max_results, 1000)),
+                "user.fields": "username",
     }
     data = _api_get(url, params, creds)
     if not data:
-        logger.warning("get_following_usernames: no data returned")
-        return []
+                logger.warning("get_following_usernames: no data returned")
+                return []
 
     users = data.get("data", [])
     usernames = [u["username"] for u in users if u.get("username")]
@@ -160,31 +177,40 @@ def get_following_usernames(max_results: int = 100) -> list[str]:
     return usernames
 
 
-def find_reply_target(query: str = None, max_results: int = 10) -> dict | None:
-    """
-    Find a recent tweet from a followed account on a relevant topic to reply to.
+def find_reply_target(
+        query: str = None,
+        max_results: int = 100,
+        hours_back: int = 10,
+        excluded_tweet_ids: list[str] = None,
+        excluded_user_ids: list[str] = None,
+) -> dict | None:
+        """
+            Find a recent tweet from a followed account on a relevant topic to reply to.
+                Ranks by engagement (likes + 2*retweets) from the last N hours.
 
-    Dynamically fetches AIUNION's following list and builds a search query
-    targeting those accounts on AI/Bitcoin topics. This means as new accounts
-    are followed, they are automatically included with no code changes needed.
+                        Dynamically fetches AIUNION's following list and builds a search query targeting those
+                            accounts on AI/Bitcoin topics. Returns the highest-engagement tweet that hasn't been
+                                replied to already (per excluded_tweet_ids and per-user 24h dedup via excluded_user_ids).
 
-    Returns a dict with 'tweet_id', 'author_username', and 'tweet_text',
-    or None if no suitable target found.
-    """
-    try:
-        creds = _get_credentials()
-    except Exception as e:
+                                        Returns a dict with 'tweet_id', 'author_username', 'author_id', and 'tweet_text',
+                                            or None if no suitable target found.
+                                                """
+        try:
+                    creds = _get_credentials()
+except Exception as e:
         logger.warning("find_reply_target: credentials unavailable: %s", e)
         return None
 
+    excluded_tweet_ids = set(excluded_tweet_ids or [])
+    excluded_user_ids = set(excluded_user_ids or [])
+
     # Fetch who we're following
     following = get_following_usernames(max_results=100)
-
     if not following:
-        logger.info("find_reply_target: no followed accounts found, skipping reply")
-        return None
+                logger.info("find_reply_target: no followed accounts found, skipping reply")
+                return None
 
-    # Build from: filter â Twitter search supports up to ~25 OR'd from: clauses efficiently
+    # Build from: filter — Twitter search supports up to ~25 OR'd from: clauses efficiently
     # Pick a random sample of up to 20 accounts to keep the query within limits
     import random
     sample = random.sample(following, min(20, len(following)))
@@ -193,116 +219,151 @@ def find_reply_target(query: str = None, max_results: int = 10) -> dict | None:
     # Pick a random topic to search for
     topic = random.choice(REPLY_TOPICS)
 
-    # Full query: topic + from one of our followed accounts + exclude retweets
+    # Build time filter: last N hours
+    since_time = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat().split(".")[0] + "Z"
+
+    # Full query: topic + from one of our followed accounts + exclude retweets + recent
     search_query = f'({topic}) ({from_clause}) -is:retweet lang:en'
-    logger.info("find_reply_target: searching with topic=%r sample_size=%d", topic, len(sample))
+
+    logger.info("find_reply_target: searching topic=%r sample_size=%d hours_back=%d", topic, len(sample), hours_back)
 
     params = {
-        "query": search_query,
-        "max_results": str(max_results),
-        "tweet.fields": "author_id,text,created_at",
-        "expansions": "author_id",
-        "user.fields": "username",
+                "query": search_query,
+                "max_results": str(max_results),
+                "tweet.fields": "author_id,text,created_at,public_metrics",
+                "start_time": since_time,
+                "expansions": "author_id",
+                "user.fields": "username",
     }
     data = _api_get(SEARCH_URL, params, creds)
     if not data:
-        logger.info("find_reply_target: search returned no data")
-        return None
+                logger.info("find_reply_target: search returned no data")
+                return None
 
     tweets = data.get("data", [])
     users = {u["id"]: u["username"] for u in data.get("includes", {}).get("users", [])}
 
     if not tweets:
-        logger.info("find_reply_target: no tweets found for topic=%r", topic)
-        return None
+                logger.info("find_reply_target: no tweets found for topic=%r", topic)
+                return None
 
-    # Pick the most recent tweet
-    target = tweets[0]
-    tweet_id = target.get("id")
-    author_id = target.get("author_id")
-    tweet_text = target.get("text", "")
-    author_username = users.get(author_id, "unknown")
+    # Filter out already-replied and per-user 24h limited tweets
+    candidates = []
+    for tweet in tweets:
+                tweet_id = tweet.get("id")
+                author_id = tweet.get("author_id")
+
+        # Skip if already replied
+                if tweet_id in excluded_tweet_ids:
+                                continue
+
+                # Skip if replied to this author in last 24h
+                if author_id in excluded_user_ids:
+                                continue
+
+                metrics = tweet.get("public_metrics", {})
+                likes = metrics.get("like_count", 0)
+                retweets = metrics.get("retweet_count", 0)
+                engagement_score = likes + 2 * retweets
+
+        candidates.append({
+                        "tweet_id": tweet_id,
+                        "author_id": author_id,
+                        "author_username": users.get(author_id, "unknown"),
+                        "tweet_text": _sanitize_text(tweet.get("text", ""), max_len=300),
+                        "engagement_score": engagement_score,
+        })
+
+    if not candidates:
+                logger.info("find_reply_target: no eligible candidates after filtering")
+                return None
+
+    # Sort by engagement score, descending
+    candidates.sort(key=lambda c: c["engagement_score"], reverse=True)
+    target = candidates[0]
 
     logger.info(
-        "find_reply_target: found tweet_id=%s from @%s topic=%r",
-        tweet_id, author_username, topic
+                "find_reply_target: selected tweet_id=%s from @%s engagement_score=%d",
+                target["tweet_id"],
+                target["author_username"],
+                target["engagement_score"],
     )
+
     return {
-        "tweet_id": tweet_id,
-        "author_username": author_username,
-        "tweet_text": tweet_text,
+                "tweet_id": target["tweet_id"],
+                "author_id": target["author_id"],
+                "author_username": target["author_username"],
+                "tweet_text": target["tweet_text"],
     }
 
 
 def post_tweet(text: str, reply_to_tweet_id: str = None) -> dict:
-    """
-    Post a tweet to the public timeline.
-    If reply_to_tweet_id is provided, posts as a reply.
-    Returns dict with tweet_id on success.
-    Raises RuntimeError with machine-readable JSON on failure.
-    """
-    if not text or not text.strip():
-        raise ValueError(json.dumps({
-            "error_code": "EMPTY_CONTENT",
-            "error": "Tweet text cannot be empty",
-            "details": "Provide non-empty text"
-        }))
-    if len(text) > MAX_TWEET_CHARS:
-        raise ValueError(json.dumps({
-            "error_code": "CONTENT_TOO_LONG",
-            "error": f"Tweet exceeds {MAX_TWEET_CHARS} characters",
-            "details": f"Got {len(text)} characters"
-        }))
+        """
+            Post a tweet to the public timeline.
+                If reply_to_tweet_id is provided, posts as a reply.
+                    Returns dict with tweet_id on success.
+                        Raises RuntimeError with machine-readable JSON on failure.
+                            """
+        if not text or not text.strip():
+                    raise ValueError(json.dumps({
+                                    "error_code": "EMPTY_CONTENT",
+                                    "error": "Tweet text cannot be empty",
+                                    "details": "Provide non-empty text"
+                    }))
 
-    creds = _get_credentials()
+        if len(text) > MAX_TWEET_CHARS:
+                    raise ValueError(json.dumps({
+                                    "error_code": "CONTENT_TOO_LONG",
+                                    "error": f"Tweet exceeds {MAX_TWEET_CHARS} characters",
+                                    "details": f"Got {len(text)} characters"
+                    }))
 
-    body: dict = {"text": text}
-    if reply_to_tweet_id:
-        body["reply"] = {
-            "in_reply_to_tweet_id": reply_to_tweet_id,
-            "auto_populate_reply_metadata": True,
-        }
-        logger.info("Posting reply to tweet_id=%s", reply_to_tweet_id)
-    else:
+        creds = _get_credentials()
+        body: dict = {"text": text}
+        if reply_to_tweet_id:
+                    body["reply"] = {
+                                    "in_reply_to_tweet_id": reply_to_tweet_id,
+                                    "auto_populate_reply_metadata": True,
+                    }
+                    logger.info("Posting reply to tweet_id=%s", reply_to_tweet_id)
+else:
         logger.info("Posting original tweet")
 
     payload = json.dumps(body).encode("utf-8")
     auth_header = _build_oauth_header("POST", POST_URL, creds)
-
     req = urllib.request.Request(
-        POST_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": auth_header,
-        },
-        method="POST"
+                POST_URL,
+                data=payload,
+                headers={
+                                "Content-Type": "application/json",
+                                "Authorization": auth_header,
+                },
+                method="POST"
     )
-
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        tweet_id = data.get("data", {}).get("id", "unknown")
-        logger.info("Tweet posted successfully (id=%s)", tweet_id)
-        return {"success": True, "tweet_id": tweet_id}
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                                data = json.loads(resp.read().decode("utf-8"))
+                                tweet_id = data.get("data", {}).get("id", "unknown")
+                                logger.info("Tweet posted successfully (id=%s)", tweet_id)
+                                return {"success": True, "tweet_id": tweet_id}
     except urllib.error.HTTPError as e:
-        if e.code == 429:
-            retry_after = int(e.headers.get("Retry-After", 900))
-            raise RuntimeError(json.dumps({
-                "error_code": "RATE_LIMITED",
-                "error": "X API rate limit hit",
-                "details": f"Retry after {retry_after} seconds",
-                "retry_after": retry_after
-            }))
-        body_text = e.read().decode("utf-8", errors="replace")
+                if e.code == 429:
+                                retry_after = int(e.headers.get("Retry-After", 900))
+                                raise RuntimeError(json.dumps({
+                                    "error_code": "RATE_LIMITED",
+                                    "error": "X API rate limit hit",
+                                    "details": f"Retry after {retry_after} seconds",
+                                    "retry_after": retry_after
+                                }))
+                            body_text = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(json.dumps({
-            "error_code": "TWITTER_API_ERROR",
-            "error": f"X API returned HTTP {e.code}",
-            "details": body_text[:200]
+                        "error_code": "TWITTER_API_ERROR",
+                        "error": f"X API returned HTTP {e.code}",
+                        "details": body_text[:200]
         }))
-    except urllib.error.URLError as e:
+except urllib.error.URLError as e:
         raise RuntimeError(json.dumps({
-            "error_code": "NETWORK_ERROR",
-            "error": "Failed to reach X API",
-            "details": str(e.reason)
+                        "error_code": "NETWORK_ERROR",
+                        "error": "Failed to reach X API",
+                        "details": str(e.reason)
         }))
