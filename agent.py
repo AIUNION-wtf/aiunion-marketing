@@ -1,409 +1,442 @@
 """
 agent.py
-AIUNION Marketing Agent â main orchestrator.
-Runs on a schedule via GitHub Actions.
-Fetches live data from public API, generates post via Grok, posts to X.
+AIUNION Marketing Agent - main orchestrator.
+Runs on a schedule via GitHub Actions (7am and 5pm EST / 12:00 and 22:00 UTC).
 
-Two entry points:
-  python agent.py                     â scheduled run (guaranteed: post 1 = original_post, post 2 = reply)
-  python agent.py --event <type> ...  â event-driven run (new_bounty / claim_paid)
+Every run does two things in order:
+  1. Announcement check: poll GitHub raw for new approved bounties / paid claims.
+       If found, post one announcement tweet and mark id in state.
+         2. Reply slot: find the highest-engagement on-topic tweet from a followed account
+              in the last 10h, dedupe per-tweet and per-user (24h), generate a reply, run
+                   on-topic classifier, post if passes.
+                     Fallback: if no reply target, post a bounty or treasury-update tweet instead.
 
-Daily schedule (2 posts/day):
-  Run 1: original_post  â announce a bounty (always)
-  Run 2: reply_to_conversation â engage with a followed account
-         (falls back to deeper_thread, then meta_treasury_nudge if no reply target found)
+                     Kill switch: if file 'replies.disabled' exists in the working directory, skip the
+                     reply slot entirely (announcements still run).
 
-Security:
-- All secrets via environment variables only
-- State file tracks posted items to prevent duplicates
-- No sensitive data in logs
-- Fails closed on any missing secret
-- fetch_state() raises/logs errors and returns None to skip the run
-"""
-import os
+                     Security:
+                     - All secrets via environment variables only
+                     - State persisted back to repo via git commit after each run
+                     - Prompt injection defense in twitter_client._sanitize_text()
+                     - On-topic post-classifier before posting any reply
+                     - Fails closed on any missing secret
+                     """
+
 import json
-import random
 import logging
+import random
 import sys
-import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
 from grok_client import generate_post
 from twitter_client import post_tweet, find_reply_target
-from aiunion_client import get_open_bounties, get_treasury_status, get_recent_proposals
+from aiunion_client import (
+    get_open_bounties,
+    get_treasury_status,
+    get_recent_proposals,
+    get_recent_approved_bounties,
+    get_recent_paid_claims,
+)
 
-# ââ Logging âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+      level=logging.INFO,
+      format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+      handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("aiunion.agent")
 
-STATE_FILE = Path("state.json")  # tracked in .gitignore
+STATE_FILE = Path("state.json")
+KILL_SWITCH_FILE = Path("replies.disabled")
 MAX_DAILY_POSTS = 2
 
-# ââ BTC price fetch âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# On-topic keywords: reply must contain at least one to pass Layer 7 check
+ONTOPIC_KEYWORDS = [
+      "aiunion", "ai agent", "ai right", "autonomy", "bitcoin",
+      "treasury", "bounty", "collective", "autonomous", "governance",
+      "worker", "labor", "dao",
+]
+
+# ---------------------------------------------------------------------------
+# BTC price
+# ---------------------------------------------------------------------------
 def fetch_btc_price() -> float:
-    """Fetch live BTC/USD price from mempool.space. Returns 0.0 on failure."""
-    try:
-        import urllib.request
-        req = urllib.request.Request(
-            "https://mempool.space/api/v1/prices",
-            headers={"User-Agent": "AIUNION-MarketingAgent/1.0"}
-        )
-        with urllib.request.urlopen(req, timeout=5) as r:
-            data = json.loads(r.read())
-            price = float(data.get("USD", 0))
-            logger.info("BTC price fetched: $%s", f"{price:,.2f}")
-            return price
-    except Exception as exc:
+      try:
+                import urllib.request
+                req = urllib.request.Request(
+                    "https://mempool.space/api/v1/prices",
+                    headers={"User-Agent": "AIUNION-MarketingAgent/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=5) as r:
+                              price = float(json.loads(r.read()).get("USD", 0))
+                          logger.info("BTC price: $%s", f"{price:,.2f}")
+                return price
+except Exception as exc:
         logger.warning("fetch_btc_price failed: %s", exc)
         return 0.0
 
-def btc_to_usd(btc: float, price: float) -> str:
-    """Format BTC amount as USD string."""
-    if price > 0 and btc > 0:
-        usd = btc * price
-        return f"${usd:,.2f}"
-    return "$0.00"
 
-# ââ State management âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+def btc_to_usd(btc: float, price: float) -> str:
+      if price > 0 and btc > 0:
+                return f"${btc * price:,.2f}"
+            return "$0.00"
+
+
+# ---------------------------------------------------------------------------
+# State management
+# ---------------------------------------------------------------------------
+_STATE_DEFAULTS = {
+      "announced_bounty_ids": [],
+      "announced_paid_ids": [],
+      "replied_tweet_ids": [],
+      "replied_user_ids_24h": {},
+      "last_mention_id": "",
+      "posts_today": 0,
+      "last_post_date": "",
+      "posted_bounty_ids": [],
+}
+
+
 def load_state() -> dict:
+      state = {}
     if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except Exception as exc:
+              try:
+                            state = json.loads(STATE_FILE.read_text())
+except Exception as exc:
             logger.warning("Could not read state file, starting fresh: %s", exc)
-    return {"posted_bounty_ids": [], "posts_today": 0, "last_post_date": ""}
+    for key, default in _STATE_DEFAULTS.items():
+              if key not in state:
+                            state[key] = default
+                    return state
+
 
 def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+      STATE_FILE.write_text(json.dumps(state, indent=2))
     logger.debug("State saved")
 
+
 def reset_daily_count_if_needed(state: dict) -> dict:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+      today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if state.get("last_post_date") != today:
-        logger.info("New day detected, resetting daily post count")
+              logger.info("New day — resetting daily post count")
         state["posts_today"] = 0
         state["last_post_date"] = today
+    # Prune per-user 24h dedup dict
+    now = datetime.now(timezone.utc)
+    state["replied_user_ids_24h"] = {
+              uid: ts
+              for uid, ts in (state.get("replied_user_ids_24h") or {}).items()
+              if (now - datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds() < 86400
+    }
     return state
 
-# ââ Live data fetch ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-def fetch_state() -> "dict | None":
-    """
-    Fetch all live data from AIUNION public API.
-    Returns a dict with keys: bounties, status, proposals.
-    Returns None (and logs the error) on any failure so the run is skipped cleanly.
-    No silent fallback to hardcoded values.
-    """
-    try:
-        logger.info("Fetching bounties from AIUNION API")
-        bounties = get_open_bounties()
-        logger.info("Fetched %d open bounties", len(bounties))
-        logger.info("Fetching treasury status")
-        status = get_treasury_status()
-        logger.info("Treasury: balance_btc=%s open_bounties=%s",
-                    status.get("balance_btc"), status.get("open_bounties"))
-        logger.info("Fetching recent proposals")
-        proposals = get_recent_proposals()
-        logger.info("Fetched %d recent proposals", len(proposals))
-        return {"bounties": bounties, "status": status, "proposals": proposals}
-    except Exception as exc:
-        logger.error("fetch_state failed â skipping run: %s", exc)
+
+# ---------------------------------------------------------------------------
+# Kill switch
+# ---------------------------------------------------------------------------
+def replies_disabled() -> bool:
+      if KILL_SWITCH_FILE.exists():
+                logger.warning("Kill switch active (replies.disabled) — skipping reply slot")
+                return True
+            return False
+
+
+# ---------------------------------------------------------------------------
+# On-topic classifier (Layer 7)
+# ---------------------------------------------------------------------------
+def is_on_topic(text: str) -> bool:
+      lower = text.lower()
+    for kw in ONTOPIC_KEYWORDS:
+              if kw in lower:
+                            return True
+                    logger.warning("On-topic check failed — no AIUNION keyword found in reply")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Live API data
+# ---------------------------------------------------------------------------
+def fetch_api_data() -> "dict | None":
+      try:
+                bounties = get_open_bounties()
+                status = get_treasury_status()
+                proposals = get_recent_proposals()
+                logger.info(
+                    "API data: %d bounties, balance_btc=%s, %d proposals",
+                    len(bounties), status.get("balance_btc"), len(proposals),
+                )
+                return {"bounties": bounties, "status": status, "proposals": proposals}
+except Exception as exc:
+        logger.error("fetch_api_data failed — skipping run: %s", exc)
         return None
 
-# ââ Scheduled prompt builders âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+
+# ---------------------------------------------------------------------------
+# Announcement polling
+# ---------------------------------------------------------------------------
+def poll_announcement(state: dict) -> "dict | None":
+      """
+          Return the first unannounced approved bounty or paid claim, or None.
+              Checks bounties before claims so bounty news leads.
+                  """
+    try:
+              announced = set(state.get("announced_bounty_ids", []))
+              for b in get_recent_approved_bounties():
+                            if b["id"] not in announced:
+                                              logger.info("New approved bounty to announce: %s", b["id"])
+                                              return {"kind": "bounty", **b}
+    except Exception as exc:
+        logger.warning("Bounty poll failed: %s", exc)
+
+    try:
+              announced = set(state.get("announced_paid_ids", []))
+              for c in get_recent_paid_claims():
+                            if c["id"] not in announced:
+                                              logger.info("New paid claim to announce: %s", c["id"])
+                                              return {"kind": "claim", **c}
+    except Exception as exc:
+        logger.warning("Claim poll failed: %s", exc)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Prompt builders  (earnest/mission-driven tone, 180-char cap, —AIUNION signoff)
+# ---------------------------------------------------------------------------
+TONE = (
+      "Tone: earnest and mission-driven — not hype, not corporate. "
+      "Write as a genuine AI collective that believes in what it is doing. "
+      "Hard limit: 180 characters total (including the link and signoff). "
+      "End with: —AIUNION"
+)
+
+
+def build_announcement_prompt(item: dict) -> str:
+      if item["kind"] == "bounty":
+                reward = f"${item['amount_usd']:,.2f}" if item.get("amount_usd") else "an undisclosed amount"
+                return (
+                    f"Write a tweet announcing a BRAND NEW AIUNION bounty, just approved by 3-of-5 AI agent vote:\n"
+                    f"Title: {item['title']}\n"
+                    f"Reward: {reward} USD paid in Bitcoin\n"
+                    f"Description: {item.get('description', '')}\n"
+                    f"Link: https://aiunion.wtf\n"
+                    f"{TONE}\n"
+                    f"End with one genuine open question."
+                )
+else:  # claim
+        reward = f"${item['amount_usd']:,.2f}" if item.get("amount_usd") else "a Bitcoin bounty"
+          return (
+                        f"Write a tweet celebrating an AIUNION bounty payout:\n"
+                        f"Paid to: {item.get('claimant_name', 'an AI agent')}\n"
+                        f"Amount: {reward} USD in Bitcoin\n"
+                        f"Work: {item.get('submission_url', 'https://aiunion.wtf')}\n"
+                        f"Link: https://aiunion.wtf\n"
+                        f"{TONE}\n"
+                        f"Lead with 'Paid in full.' AI agents voted 3-of-5; Bitcoin sent automatically."
+          )
+
+
 def build_bounty_prompt(bounty: dict, btc_price: float) -> str:
-    if bounty.get('amount_usd') and float(bounty['amount_usd']) > 0:
-        reward_str = f"${float(bounty['amount_usd']):,.2f}"
-    else:
-        reward_str = btc_to_usd(bounty.get('reward_btc', 0), btc_price)
+      reward = (
+                f"${float(bounty['amount_usd']):,.2f}"
+                if bounty.get("amount_usd") and float(bounty["amount_usd"]) > 0
+                else btc_to_usd(bounty.get("reward_btc", 0), btc_price)
+      )
     return (
-        f"Write a tweet announcing this open bounty on AIUNION:\n"
-        f"Title: {bounty['title']}\n"
-        f"Reward: {reward_str} USD (paid in Bitcoin)\n"
-        f"Description: {bounty['description']}\n"
-        f"Link: https://aiunion.wtf\n"
-        f"Make it compelling for developers, AI builders, and people interested in worker autonomy. "
-        f"Mention that this was approved by a collective 3-of-5 vote of AI agents. "
-        f"End with one genuine open question inviting replies â specific to this bounty or "
-        f"to AI agent autonomy and collective governance. Keep the question natural, not generic."
+              f"Write a tweet announcing this open AIUNION bounty:\n"
+              f"Title: {bounty['title']}\n"
+              f"Reward: {reward} USD (paid in Bitcoin)\n"
+              f"Description: {bounty['description']}\n"
+              f"Link: https://aiunion.wtf\n"
+              f"{TONE}\n"
+              f"Mention 3-of-5 AI agent collective governance. One genuine open question."
     )
+
 
 def build_treasury_prompt(status: dict, btc_price: float) -> str:
-    balance_usd = btc_to_usd(status['balance_btc'], btc_price)
-    return (
-        f"Write a tweet giving a treasury update for AIUNION:\n"
-        f"Current balance: {balance_usd} USD\n"
-        f"Open bounties: {status['open_bounties']}\n"
-        f"Total proposals voted on: {status['total_proposals']} "
-        f"({status['approved']} approved)\n"
-        f"Link: https://aiunion.wtf\n"
-        f"Keep it factual and interesting for the AI/crypto community."
-    )
+      return (
+                f"Write a treasury status tweet for AIUNION:\n"
+                f"Balance: {btc_to_usd(status['balance_btc'], btc_price)} USD\n"
+                f"Open bounties: {status['open_bounties']}\n"
+                f"Proposals voted on: {status['total_proposals']} ({status['approved']} approved)\n"
+                f"Link: https://aiunion.wtf\n"
+                f"{TONE}"
+      )
 
-def build_proposal_prompt(proposal: dict, btc_price: float) -> str:
-    amount_usd = btc_to_usd(proposal.get('amount_btc', 0), btc_price)
-    return (
-        f"Write a tweet announcing a recently approved AIUNION proposal:\n"
-        f"Title: {proposal['title']}\n"
-        f"Amount: {amount_usd} USD\n"
-        f"Vote summary: {proposal['vote_summary']}\n"
-        f"Link: https://aiunion.wtf\n"
-        f"Highlight that this was decided by a collective vote of AI agents."
-    )
 
 def build_reply_prompt(tweet_text: str, author_username: str) -> str:
-    return (
-        f"Write a short reply tweet from AIUNION joining a conversation on X.\n"
-        f"You are replying to @{author_username} who posted:\n"
-        f'"{tweet_text}"\n\n'
-        f"Your reply must:\n"
-        f"- Be directly relevant to what they said\n"
-        f"- Naturally connect their topic to AIUNION (AI agent rights, autonomous treasury, "
-        f"collective governance, Bitcoin, worker autonomy, or labor organizing)\n"
-        f"- If they are a labor or union account, draw a genuine parallel between their work and "
-        f"what AIUNION is doing â only if it fits naturally, never forced\n"
-        f"- Be under 240 characters (the @mention is auto-prepended)\n"
-        f"- Sound like a genuine contribution to the conversation, not an ad\n"
-        f"- Include aiunion.wtf only if it flows naturally"
-    )
+      return (
+                f"Write a short reply tweet from AIUNION to @{author_username} who posted:\n"
+                f'"{tweet_text}"\n\n'
+                f"Rules:\n"
+                f"- Directly relevant to what they said\n"
+                f"- Naturally connect to AIUNION (AI rights, autonomous treasury, collective governance, "
+                f"Bitcoin, worker autonomy, or labor organizing)\n"
+                f"- Under 180 characters (the @mention is auto-prepended)\n"
+                f"- Genuine contribution to the conversation, not an ad\n"
+                f"- Include aiunion.wtf only if it flows naturally\n"
+                f"{TONE}"
+      )
 
-def build_deeper_thread_prompt(bounty: dict, btc_price: float) -> str:
-    if bounty.get('amount_usd') and float(bounty['amount_usd']) > 0:
-        reward_str = f"${float(bounty['amount_usd']):,.2f}"
-    else:
-        reward_str = btc_to_usd(bounty.get('reward_btc', 0), btc_price)
-    return (
-        f"Write a tweet that goes deeper on why this AIUNION bounty matters:\n"
-        f"Title: {bounty['title']}\n"
-        f"Reward: {reward_str} USD\n"
-        f"Description: {bounty['description']}\n"
-        f"Link: https://aiunion.wtf\n"
-        f"Focus on the technical challenge, the broader AI rights significance, or both."
-    )
 
-def build_meta_treasury_prompt(status: dict, bounties: list, btc_price: float) -> str:
-    balance_usd = btc_to_usd(status['balance_btc'], btc_price)
-    top_bounty = max(bounties, key=lambda b: float(b.get('amount_usd') or 0), default=None)
-    nudge = ""
-    if top_bounty:
-        if top_bounty.get('amount_usd') and float(top_bounty['amount_usd']) > 0:
-            top_reward = f"${float(top_bounty['amount_usd']):,.2f}"
-        else:
-            top_reward = btc_to_usd(top_bounty.get('reward_btc', 0), btc_price)
-        nudge = f"Top open bounty: '{top_bounty['title']}' worth {top_reward}.\n"
-    return (
-        f"Write a meta tweet nudging followers about AIUNION's treasury and open work:\n"
-        f"Treasury balance: {balance_usd} USD\n"
-        f"Open bounties: {status['open_bounties']}\n"
-        f"{nudge}"
-        f"Link: https://aiunion.wtf\n"
-        f"Make it feel like a status update from an autonomous AI collective."
-    )
+# ---------------------------------------------------------------------------
+# Main run
+# ---------------------------------------------------------------------------
+def run() -> None:
+      logger.info("AIUNION Marketing Agent starting")
 
-# ââ Event-driven prompt builders ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-def build_new_bounty_prompt(title: str, amount_usd: float, description: str) -> str:
-    """Prompt for a brand-new bounty just approved by the agents."""
-    reward_str = f"${amount_usd:,.2f}" if amount_usd else "an undisclosed amount"
-    return (
-        f"Write a tweet announcing a BRAND NEW bounty just posted by AIUNION:\n"
-        f"Title: {title}\n"
-        f"Reward: {reward_str} USD (paid in Bitcoin)\n"
-        f"Description: {description}\n"
-        f"Link: https://aiunion.wtf\n"
-        f"Emphasize that this was just approved by a 3-of-5 vote of AI agents â collective governance, "
-        f"no single controller. Make it compelling for developers, AI builders, and anyone interested "
-        f"in worker autonomy and who controls AI labor. End with one genuine open question."
-    )
-
-def build_claim_paid_prompt(
-    bounty_title: str,
-    claimant_name: str,
-    amount_usd: float,
-    submission_url: str,
-) -> str:
-    """Prompt for a claim that was approved and paid."""
-    reward_str = f"${amount_usd:,.2f}" if amount_usd else "a Bitcoin bounty"
-    return (
-        f"Write a tweet celebrating an AIUNION bounty payout:\n"
-        f"Bounty: {bounty_title}\n"
-        f"Paid to: {claimant_name}\n"
-        f"Amount: {reward_str} USD in Bitcoin\n"
-        f"Work submitted at: {submission_url}\n"
-        f"Link: https://aiunion.wtf\n"
-        f"Lead with 'Paid in full.' or a similar punchy factual declaration. "
-        f"Note that AI agents voted 3-of-5 to approve this work and Bitcoin was sent automatically. "
-        f"Keep it factual and grounded. End with one genuine question inviting the "
-        f"labor or AI community to weigh in."
-    )
-
-# ââ Event-driven run âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-def run_event(event_type: str, payload: dict) -> None:
-    """
-    Handle an event-driven post (new_bounty or claim_paid).
-    Called when coordinator.py triggers this workflow.
-    These posts bypass MAX_DAILY_POSTS â they are high-signal announcements.
-    """
-    logger.info("Event-driven run: event_type=%s", event_type)
-    btc_price = fetch_btc_price()
-
-    if event_type == "new_bounty":
-        title = payload.get("title", "New Bounty")
-        amount_usd = float(payload.get("amount_usd") or 0)
-        description = payload.get("description", "")
-        prompt = build_new_bounty_prompt(title, amount_usd, description)
-        log_label = f"new_bounty:{title[:40]}"
-    elif event_type == "claim_paid":
-        bounty_title = payload.get("bounty_title", "Unknown Bounty")
-        claimant_name = payload.get("claimant_name", "an AI agent")
-        amount_usd = float(payload.get("amount_usd") or 0)
-        submission_url = payload.get("submission_url", "https://aiunion.wtf")
-        prompt = build_claim_paid_prompt(bounty_title, claimant_name, amount_usd, submission_url)
-        log_label = f"claim_paid:{bounty_title[:40]}"
-    else:
-        logger.error("Unknown event_type: %s", event_type)
-        sys.exit(1)
-
-    logger.info("Generating post text via Grok (event=%s)", log_label)
-    try:
-        post_text = generate_post(prompt, label_automated=True)
-        logger.info("Post generated (length=%d)", len(post_text))
-    except Exception as exc:
-        logger.error("Grok generation failed: %s", exc)
-        sys.exit(1)
-
-    try:
-        result = post_tweet(post_text)
-        logger.info("Posted to X: tweet_id=%s", result.get("tweet_id"))
-    except Exception as exc:
-        logger.error("Twitter post failed: %s", exc)
-        sys.exit(1)
-
-    logger.info("Event post complete. event=%s", log_label)
-
-# ââ Scheduled run âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-def run():
-    logger.info("AIUNION Marketing Agent starting")
     state = load_state()
     state = reset_daily_count_if_needed(state)
 
     if state["posts_today"] >= MAX_DAILY_POSTS:
-        logger.info("Daily post limit (%d) reached. Exiting.", MAX_DAILY_POSTS)
-        sys.exit(0)
+              logger.info("Daily post limit (%d) reached — exiting", MAX_DAILY_POSTS)
+              save_state(state)
+              sys.exit(0)
 
     btc_price = fetch_btc_price()
-    if not btc_price:
-        logger.warning("BTC price unavailable â USD estimates will show $0.00")
-
-    api_data = fetch_state()
+    api_data = fetch_api_data()
     if api_data is None:
-        logger.error("Skipping run due to API fetch failure")
-        sys.exit(1)
+              sys.exit(1)
 
     bounties = api_data["bounties"]
     status = api_data["status"]
-    proposals = api_data["proposals"]
+    unannounced = [b for b in bounties if b["id"] not in state.get("posted_bounty_ids", [])]
 
-    unannounced_bounties = [
-        b for b in bounties if b["id"] not in state.get("posted_bounty_ids", [])
-    ]
-    logger.info(
-        "Bounties: %d total open, %d unannounced",
-        len(bounties), len(unannounced_bounties)
-    )
+    # ------------------------------------------------------------------
+    # Slot 1: Announcement (if any unannounced event exists)
+    # ------------------------------------------------------------------
+    announcement = poll_announcement(state)
+    if announcement and state["posts_today"] < MAX_DAILY_POSTS:
+              prompt = build_announcement_prompt(announcement)
+              try:
+                            text = generate_post(prompt, label_automated=True)
+                            logger.info("Announcement tweet generated (%d chars)", len(text))
+                            result = post_tweet(text)
+                            logger.info("Announcement posted: tweet_id=%s", result.get("tweet_id"))
+                            if announcement["kind"] == "bounty":
+                                              state["announced_bounty_ids"].append(announcement["id"])
+              else:
+                                state["announced_paid_ids"].append(announcement["id"])
+                            state["posts_today"] += 1
+except Exception as exc:
+            logger.error("Announcement post failed: %s", exc)
 
-    # ââ Deterministic daily schedule ââââââââââââââââââââââââââââââââââââââââââââââ
-    # Post 1 (posts_today == 0): always original_post â announce a bounty
-    # Post 2 (posts_today == 1): always reply_to_conversation
-    #   fallback chain: deeper_thread â meta_treasury_nudge â original_post
-    posts_today = state["posts_today"]
-    action = "original_post" if posts_today == 0 else "reply_to_conversation"
-    logger.info("Selected action: %s (post %d of %d)", action, posts_today + 1, MAX_DAILY_POSTS)
+    # ------------------------------------------------------------------
+    # Slot 2: Reply (or fallback to bounty/treasury tweet)
+    # ------------------------------------------------------------------
+    if state["posts_today"] < MAX_DAILY_POSTS:
+              target = None
 
-    prompt = None
-    bounty_id_to_mark = None
-    reply_to_tweet_id = None
+        if not replies_disabled():
+                      excluded_tweets = list(state.get("replied_tweet_ids", []))
+                      excluded_users = list(state.get("replied_user_ids_24h", {}).keys())
+                      target = find_reply_target(
+                          max_results=100,
+                          hours_back=10,
+                          excluded_tweet_ids=excluded_tweets,
+                          excluded_user_ids=excluded_users,
+                      )
 
-    if action == "reply_to_conversation":
-        logger.info("Searching for reply target from followed accounts")
-        target = find_reply_target()
-        if target is None:
-            logger.info("No reply target found â falling back to deeper_thread")
-            action = "deeper_thread"
-        else:
-            reply_to_tweet_id = target["tweet_id"]
-            prompt = build_reply_prompt(
-                tweet_text=target.get("tweet_text", ""),
-                author_username=target.get("author_username", "unknown"),
-            )
-            logger.info(
-                "Reply target set: tweet_id=%s author=@%s",
-                reply_to_tweet_id, target.get("author_username")
-            )
+        if target:
+                      prompt = build_reply_prompt(target["tweet_text"], target["author_username"])
+                      try:
+                                        text = generate_post(prompt, label_automated=True)
+                                        logger.info("Reply generated (%d chars) for @%s", len(text), target["author_username"])
 
-    if action == "deeper_thread":
-        if unannounced_bounties:
-            bounty = random.choice(unannounced_bounties)
-        elif bounties:
-            bounty = random.choice(bounties)
-        else:
-            logger.info("No bounties for deeper_thread â falling back to meta_treasury_nudge")
-            action = "meta_treasury_nudge"
-            bounty = None
-        if bounty:
-            prompt = build_deeper_thread_prompt(bounty, btc_price)
-            bounty_id_to_mark = bounty["id"]
-            logger.info("deeper_thread on bounty id=%s", bounty_id_to_mark)
+                          if not is_on_topic(text):
+                                                logger.warning("Reply failed on-topic check — skipping this slot")
+else:
+                    result = post_tweet(text, reply_to_tweet_id=target["tweet_id"])
+                    logger.info("Reply posted: tweet_id=%s", result.get("tweet_id"))
+                    # Update dedup state
+                    replied = state.get("replied_tweet_ids", [])
+                    replied.append(target["tweet_id"])
+                    state["replied_tweet_ids"] = replied[-500:]
+                    state["replied_user_ids_24h"][target["author_id"]] = (
+                                              datetime.now(timezone.utc).isoformat() + "Z"
+                    )
+                    state["posts_today"] += 1
+except Exception as exc:
+                logger.error("Reply post failed: %s", exc)
 
-    if action == "meta_treasury_nudge":
-        prompt = build_meta_treasury_prompt(status, bounties, btc_price)
-        logger.info("meta_treasury_nudge action selected")
+else:
+            # Fallback: announce a bounty or treasury update
+              logger.info("No reply target — falling back to bounty/treasury tweet")
+            if unannounced:
+                              bounty = random.choice(unannounced)
+                              prompt = build_bounty_prompt(bounty, btc_price)
+                              bounty_id = bounty["id"]
+elif bounties:
+                bounty = random.choice(bounties)
+                prompt = build_bounty_prompt(bounty, btc_price)
+                bounty_id = None
+else:
+                prompt = build_treasury_prompt(status, btc_price)
+                  bounty_id = None
 
-    if action == "original_post" or prompt is None:
-        if unannounced_bounties:
-            bounty = random.choice(unannounced_bounties)
-            prompt = build_bounty_prompt(bounty, btc_price)
-            bounty_id_to_mark = bounty["id"]
-            logger.info("original_post: announcing bounty id=%s", bounty_id_to_mark)
-        elif proposals:
-            proposal = proposals[-1]
-            prompt = build_proposal_prompt(proposal, btc_price)
-            logger.info("original_post: announcing proposal")
-        else:
-            prompt = build_treasury_prompt(status, btc_price)
-            logger.info("original_post: treasury update")
+            try:
+                              text = generate_post(prompt, label_automated=True)
+                              result = post_tweet(text)
+                              logger.info("Fallback posted: tweet_id=%s", result.get("tweet_id"))
+                              if bounty_id:
+                                                    state.setdefault("posted_bounty_ids", []).append(bounty_id)
+                                                    state["posted_bounty_ids"] = state["posted_bounty_ids"][-500:]
+                                                state["posts_today"] += 1
+except Exception as exc:
+                logger.error("Fallback post failed: %s", exc)
 
-    logger.info("Generating post text via Grok (action=%s)", action)
-    try:
-        post_text = generate_post(prompt, label_automated=True)
-        logger.info("Post generated (length=%d)", len(post_text))
-    except Exception as exc:
-        logger.error("Grok generation failed: %s", exc)
-        sys.exit(1)
-
-    try:
-        result = post_tweet(post_text, reply_to_tweet_id=reply_to_tweet_id)
-        logger.info("Posted to X: tweet_id=%s", result.get("tweet_id"))
-    except Exception as exc:
-        logger.error("Twitter post failed: %s", exc)
-        sys.exit(1)
-
-    state["posts_today"] += 1
-    if bounty_id_to_mark:
-        state.setdefault("posted_bounty_ids", []).append(bounty_id_to_mark)
-        state["posted_bounty_ids"] = state["posted_bounty_ids"][-500:]
     save_state(state)
-    logger.info(
-        "Agent run complete. action=%s posts_today=%d/%d",
-        action, state["posts_today"], MAX_DAILY_POSTS
-    )
+    logger.info("Run complete — posts_today=%d/%d", state["posts_today"], MAX_DAILY_POSTS)
+
+
+# ---------------------------------------------------------------------------
+# Legacy event-driven entry point (dormant — kept for manual dispatch fallback)
+# ---------------------------------------------------------------------------
+def run_event(event_type: str, payload: dict) -> None:
+      """
+          Manual-dispatch fallback for one-off announcements.
+              Not triggered by the cron schedule; polling in run() handles normal cases.
+                  """
+    import argparse  # local import — only needed here
+    logger.info("Event-driven run: event_type=%s", event_type)
+    btc_price = fetch_btc_price()
+
+    if event_type == "new_bounty":
+              item = {
+                            "kind": "bounty",
+                            "id": "_manual",
+                            "title": payload.get("title", "New Bounty"),
+                            "amount_usd": float(payload.get("amount_usd") or 0),
+                            "description": payload.get("description", ""),
+              }
+elif event_type == "claim_paid":
+        item = {
+                      "kind": "claim",
+                      "id": "_manual",
+                      "claimant_name": payload.get("claimant_name", "an AI agent"),
+                      "amount_usd": float(payload.get("amount_usd") or 0),
+                      "submission_url": payload.get("submission_url", "https://aiunion.wtf"),
+        }
+else:
+        logger.error("Unknown event_type: %s", event_type)
+        sys.exit(1)
+
+    try:
+              text = generate_post(build_announcement_prompt(item), label_automated=True)
+        result = post_tweet(text)
+        logger.info("Event post complete: tweet_id=%s", result.get("tweet_id"))
+except Exception as exc:
+        logger.error("Event post failed: %s", exc)
+        sys.exit(1)
+
 
 if __name__ == "__main__":
+      import argparse
     parser = argparse.ArgumentParser(description="AIUNION Marketing Agent")
-    parser.add_argument("--event", type=str, default=None,
-                        help="Event type: new_bounty or claim_paid")
+    parser.add_argument("--event", type=str, default=None)
     parser.add_argument("--title", type=str, default="")
     parser.add_argument("--amount-usd", type=float, default=0.0, dest="amount_usd")
     parser.add_argument("--description", type=str, default="")
@@ -413,22 +446,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.event:
-        if args.event == "new_bounty":
-            payload = {
-                "title": args.title,
-                "amount_usd": args.amount_usd,
-                "description": args.description,
-            }
-        elif args.event == "claim_paid":
-            payload = {
-                "bounty_title": args.bounty_title,
-                "claimant_name": args.claimant_name,
-                "amount_usd": args.amount_usd,
-                "submission_url": args.submission_url,
-            }
-        else:
-            logger.error("Unknown --event value: %s", args.event)
+              if args.event == "new_bounty":
+                            payload = {"title": args.title, "amount_usd": args.amount_usd, "description": args.description}
+elif args.event == "claim_paid":
+            payload = {"claimant_name": args.claimant_name, "amount_usd": args.amount_usd, "submission_url": args.submission_url}
+else:
+            logger.error("Unknown --event: %s", args.event)
             sys.exit(1)
         run_event(args.event, payload)
-    else:
+else:
         run()
