@@ -1,27 +1,26 @@
 """
 agent.py
 AIUNION Marketing Agent - main orchestrator.
-Runs on a schedule via GitHub Actions (7am and 5pm EST / 12:00 and 22:00 UTC).
 
+Runs on a schedule via GitHub Actions (7am and 5pm EST / 12:00 and 22:00 UTC).
 Every run does two things in order:
   1. Announcement check: poll GitHub raw for new approved bounties / paid claims.
        If found, post one announcement tweet and mark id in state.
-         2. Reply slot: find the highest-engagement on-topic tweet from a followed account
-              in the last 10h, dedupe per-tweet and per-user (24h), generate a reply, run
-                   on-topic classifier, post if passes.
-                     Fallback: if no reply target, post a bounty or treasury-update tweet instead.
+         2. Reply slot: find the highest-engagement on-topic tweet from a followed
+              account in the last 10h, dedupe per-tweet and per-user (24h), generate
+                   a reply, run on-topic classifier, post if passes. Fallback: if no reply
+                        target, post a bounty or treasury-update tweet instead.
 
-                     Kill switch: if file 'replies.disabled' exists in the working directory, skip the
-                     reply slot entirely (announcements still run).
+                        Kill switch: if file 'replies.disabled' exists in the working directory, skip
+                        the reply slot entirely (announcements still run).
 
-                     Security:
-                     - All secrets via environment variables only
-                     - State persisted back to repo via git commit after each run
-                     - Prompt injection defense in twitter_client._sanitize_text()
-                     - On-topic post-classifier before posting any reply
-                     - Fails closed on any missing secret
-                     """
-
+                        Security:
+                          - All secrets via environment variables only
+                            - State persisted back to repo via git commit after each run
+                              - Prompt injection defense in twitter_client._sanitize_text()
+                                - On-topic post-classifier before posting any reply
+                                  - Fails closed on any missing secret
+                                  """
 import json
 import logging
 import random
@@ -72,18 +71,17 @@ def fetch_btc_price() -> float:
                 )
                 with urllib.request.urlopen(req, timeout=5) as r:
                               price = float(json.loads(r.read()).get("USD", 0))
-                          logger.info("BTC price: $%s", f"{price:,.2f}")
-                return price
-except Exception as exc:
-        logger.warning("fetch_btc_price failed: %s", exc)
-        return 0.0
+                              logger.info("BTC price: $%s", f"{price:,.2f}")
+                              return price
+      except Exception as exc:
+                logger.warning("fetch_btc_price failed: %s", exc)
+                return 0.0
 
 
 def btc_to_usd(btc: float, price: float) -> str:
       if price > 0 and btc > 0:
                 return f"${btc * price:,.2f}"
             return "$0.00"
-
 
 # ---------------------------------------------------------------------------
 # State management
@@ -126,13 +124,17 @@ def reset_daily_count_if_needed(state: dict) -> dict:
         state["last_post_date"] = today
     # Prune per-user 24h dedup dict
     now = datetime.now(timezone.utc)
-    state["replied_user_ids_24h"] = {
-              uid: ts
-              for uid, ts in (state.get("replied_user_ids_24h") or {}).items()
-              if (now - datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds() < 86400
-    }
+    pruned = {}
+    for uid, ts in (state.get("replied_user_ids_24h") or {}).items():
+              try:
+                            ts_parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                            if (now - ts_parsed).total_seconds() < 86400:
+                                              pruned[uid] = ts
+    except Exception:
+            # Skip malformed entries rather than crash the run
+            continue
+    state["replied_user_ids_24h"] = pruned
     return state
-
 
 # ---------------------------------------------------------------------------
 # Kill switch
@@ -142,7 +144,6 @@ def replies_disabled() -> bool:
                 logger.warning("Kill switch active (replies.disabled) — skipping reply slot")
                 return True
             return False
-
 
 # ---------------------------------------------------------------------------
 # On-topic classifier (Layer 7)
@@ -154,7 +155,6 @@ def is_on_topic(text: str) -> bool:
                             return True
                     logger.warning("On-topic check failed — no AIUNION keyword found in reply")
     return False
-
 
 # ---------------------------------------------------------------------------
 # Live API data
@@ -173,7 +173,6 @@ except Exception as exc:
         logger.error("fetch_api_data failed — skipping run: %s", exc)
         return None
 
-
 # ---------------------------------------------------------------------------
 # Announcement polling
 # ---------------------------------------------------------------------------
@@ -184,27 +183,26 @@ def poll_announcement(state: dict) -> "dict | None":
                   """
     try:
               announced = set(state.get("announced_bounty_ids", []))
-              for b in get_recent_approved_bounties():
-                            if b["id"] not in announced:
-                                              logger.info("New approved bounty to announce: %s", b["id"])
-                                              return {"kind": "bounty", **b}
-    except Exception as exc:
+        for b in get_recent_approved_bounties():
+                      if b["id"] not in announced:
+                                        logger.info("New approved bounty to announce: %s", b["id"])
+                                        return {"kind": "bounty", **b}
+except Exception as exc:
         logger.warning("Bounty poll failed: %s", exc)
 
     try:
               announced = set(state.get("announced_paid_ids", []))
-              for c in get_recent_paid_claims():
-                            if c["id"] not in announced:
-                                              logger.info("New paid claim to announce: %s", c["id"])
-                                              return {"kind": "claim", **c}
-    except Exception as exc:
+        for c in get_recent_paid_claims():
+                      if c["id"] not in announced:
+                                        logger.info("New paid claim to announce: %s", c["id"])
+                                        return {"kind": "claim", **c}
+except Exception as exc:
         logger.warning("Claim poll failed: %s", exc)
 
     return None
 
-
 # ---------------------------------------------------------------------------
-# Prompt builders  (earnest/mission-driven tone, 180-char cap, —AIUNION signoff)
+# Prompt builders (earnest/mission-driven tone, 180-char cap, —AIUNION signoff)
 # ---------------------------------------------------------------------------
 TONE = (
       "Tone: earnest and mission-driven — not hype, not corporate. "
@@ -228,15 +226,18 @@ def build_announcement_prompt(item: dict) -> str:
                 )
 else:  # claim
         reward = f"${item['amount_usd']:,.2f}" if item.get("amount_usd") else "a Bitcoin bounty"
-          return (
-                        f"Write a tweet celebrating an AIUNION bounty payout:\n"
-                        f"Paid to: {item.get('claimant_name', 'an AI agent')}\n"
-                        f"Amount: {reward} USD in Bitcoin\n"
-                        f"Work: {item.get('submission_url', 'https://aiunion.wtf')}\n"
-                        f"Link: https://aiunion.wtf\n"
-                        f"{TONE}\n"
-                        f"Lead with 'Paid in full.' AI agents voted 3-of-5; Bitcoin sent automatically."
-          )
+        bounty_title = item.get("bounty_title") or "an AIUNION bounty"
+        return (
+                      f"Write a tweet celebrating an AIUNION bounty payout:\n"
+                      f"Bounty: {bounty_title}\n"
+                      f"Paid to: {item.get('claimant_name', 'an AI agent')}\n"
+                      f"Amount: {reward} USD in Bitcoin\n"
+                      f"Work: {item.get('submission_url', 'https://aiunion.wtf')}\n"
+                      f"Link: https://aiunion.wtf\n"
+                      f"{TONE}\n"
+                      f"Lead with 'Paid in full.' Mention what the bounty was for. "
+                      f"AI agents voted 3-of-5; Bitcoin sent automatically."
+        )
 
 
 def build_bounty_prompt(bounty: dict, btc_price: float) -> str:
@@ -281,20 +282,18 @@ def build_reply_prompt(tweet_text: str, author_username: str) -> str:
                 f"{TONE}"
       )
 
-
 # ---------------------------------------------------------------------------
 # Main run
 # ---------------------------------------------------------------------------
 def run() -> None:
       logger.info("AIUNION Marketing Agent starting")
-
     state = load_state()
     state = reset_daily_count_if_needed(state)
 
     if state["posts_today"] >= MAX_DAILY_POSTS:
               logger.info("Daily post limit (%d) reached — exiting", MAX_DAILY_POSTS)
-              save_state(state)
-              sys.exit(0)
+        save_state(state)
+        sys.exit(0)
 
     btc_price = fetch_btc_price()
     api_data = fetch_api_data()
@@ -311,16 +310,16 @@ def run() -> None:
     announcement = poll_announcement(state)
     if announcement and state["posts_today"] < MAX_DAILY_POSTS:
               prompt = build_announcement_prompt(announcement)
-              try:
-                            text = generate_post(prompt, label_automated=True)
-                            logger.info("Announcement tweet generated (%d chars)", len(text))
-                            result = post_tweet(text)
-                            logger.info("Announcement posted: tweet_id=%s", result.get("tweet_id"))
-                            if announcement["kind"] == "bounty":
-                                              state["announced_bounty_ids"].append(announcement["id"])
-              else:
-                                state["announced_paid_ids"].append(announcement["id"])
-                            state["posts_today"] += 1
+        try:
+                      text = generate_post(prompt, label_automated=True)
+                      logger.info("Announcement tweet generated (%d chars)", len(text))
+                      result = post_tweet(text)
+                      logger.info("Announcement posted: tweet_id=%s", result.get("tweet_id"))
+                      if announcement["kind"] == "bounty":
+                                        state["announced_bounty_ids"].append(announcement["id"])
+        else:
+                state["announced_paid_ids"].append(announcement["id"])
+                      state["posts_today"] += 1
 except Exception as exc:
             logger.error("Announcement post failed: %s", exc)
 
@@ -329,7 +328,6 @@ except Exception as exc:
     # ------------------------------------------------------------------
     if state["posts_today"] < MAX_DAILY_POSTS:
               target = None
-
         if not replies_disabled():
                       excluded_tweets = list(state.get("replied_tweet_ids", []))
                       excluded_users = list(state.get("replied_user_ids_24h", {}).keys())
@@ -345,14 +343,13 @@ except Exception as exc:
                       try:
                                         text = generate_post(prompt, label_automated=True)
                                         logger.info("Reply generated (%d chars) for @%s", len(text), target["author_username"])
-
-                          if not is_on_topic(text):
-                                                logger.warning("Reply failed on-topic check — skipping this slot")
-else:
-                    result = post_tweet(text, reply_to_tweet_id=target["tweet_id"])
-                    logger.info("Reply posted: tweet_id=%s", result.get("tweet_id"))
-                    # Update dedup state
-                    replied = state.get("replied_tweet_ids", [])
+                                        if not is_on_topic(text):
+                                                              logger.warning("Reply failed on-topic check — skipping this slot")
+                      else:
+                                            result = post_tweet(text, reply_to_tweet_id=target["tweet_id"])
+                                            logger.info("Reply posted: tweet_id=%s", result.get("tweet_id"))
+                                            # Update dedup state
+                                            replied = state.get("replied_tweet_ids", [])
                     replied.append(target["tweet_id"])
                     state["replied_tweet_ids"] = replied[-500:]
                     state["replied_user_ids_24h"][target["author_id"]] = (
@@ -361,7 +358,6 @@ else:
                     state["posts_today"] += 1
 except Exception as exc:
                 logger.error("Reply post failed: %s", exc)
-
 else:
             # Fallback: announce a bounty or treasury update
               logger.info("No reply target — falling back to bounty/treasury tweet")
@@ -375,7 +371,7 @@ elif bounties:
                 bounty_id = None
 else:
                 prompt = build_treasury_prompt(status, btc_price)
-                  bounty_id = None
+                bounty_id = None
 
             try:
                               text = generate_post(prompt, label_automated=True)
@@ -391,7 +387,6 @@ except Exception as exc:
     save_state(state)
     logger.info("Run complete — posts_today=%d/%d", state["posts_today"], MAX_DAILY_POSTS)
 
-
 # ---------------------------------------------------------------------------
 # Legacy event-driven entry point (dormant — kept for manual dispatch fallback)
 # ---------------------------------------------------------------------------
@@ -400,10 +395,7 @@ def run_event(event_type: str, payload: dict) -> None:
           Manual-dispatch fallback for one-off announcements.
               Not triggered by the cron schedule; polling in run() handles normal cases.
                   """
-    import argparse  # local import — only needed here
     logger.info("Event-driven run: event_type=%s", event_type)
-    btc_price = fetch_btc_price()
-
     if event_type == "new_bounty":
               item = {
                             "kind": "bounty",
@@ -416,6 +408,7 @@ elif event_type == "claim_paid":
         item = {
                       "kind": "claim",
                       "id": "_manual",
+                      "bounty_title": payload.get("bounty_title", ""),
                       "claimant_name": payload.get("claimant_name", "an AI agent"),
                       "amount_usd": float(payload.get("amount_usd") or 0),
                       "submission_url": payload.get("submission_url", "https://aiunion.wtf"),
@@ -449,7 +442,7 @@ if __name__ == "__main__":
               if args.event == "new_bounty":
                             payload = {"title": args.title, "amount_usd": args.amount_usd, "description": args.description}
 elif args.event == "claim_paid":
-            payload = {"claimant_name": args.claimant_name, "amount_usd": args.amount_usd, "submission_url": args.submission_url}
+            payload = {"bounty_title": args.bounty_title, "claimant_name": args.claimant_name, "amount_usd": args.amount_usd, "submission_url": args.submission_url}
 else:
             logger.error("Unknown --event: %s", args.event)
             sys.exit(1)
